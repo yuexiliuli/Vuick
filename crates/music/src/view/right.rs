@@ -321,19 +321,15 @@ impl super::MusicView {
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
             match label {
                 "收藏" => this.like_current(cx),
-                _ => this.toast_msg(
-                    match label {
-                        "加入队列" => "已添加到队列",
-                        "分享" => "分享链接已复制",
-                        _ => label,
-                    },
-                    cx,
-                ),
+                "加入队列" => this.add_to_queue_current(cx),
+                "分享" => this.share_current(_w, cx),
+                _ => {}
             }
         });
         div()
             .id(id)
             .relative()
+            .debug_selector(move || id.into())
             .flex()
             .items_center()
             .gap_x(px(5.))

@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use gpui::{AppContext as _, Bounds, Entity, Focusable as _, MouseButton, Pixels, TestAppContext, VisualTestContext, px};
+use gpui::{AppContext as _, Bounds, Entity, MouseButton, Pixels, TestAppContext, VisualTestContext, px};
 
 use super::lyrics::LYRIC_ROW_H;
 use super::icon::MusicIcon;
@@ -372,6 +372,7 @@ fn filter_matches_case_insensitive_and_chinese() {
         grad: (0x7c, 0x5c, 0xfc),
         cover_path: None,
         lyrics: None,
+        mtime: None,
     };
     let tracks = vec![
         mk(0, "周杰伦", "晴天"),
@@ -4043,9 +4044,9 @@ async fn recent_section_filters_by_search_query(cx: &mut TestAppContext) {
     );
 }
 
-/// 切换音乐库目录（load_dir 换代）→ 本次会话播放历史清空。
+/// 切换音乐库目录（load_dir 换代）→ 最近播放跨切库持久保留（与收藏同语义）。
 #[gpui::test]
-async fn switching_music_dir_clears_session_recent(cx: &mut TestAppContext) {
+async fn switching_music_dir_keeps_recent(cx: &mut TestAppContext) {
     // 两个目录都先建好（add_window_view 后 cx 已借给 wcx，不能再取 &mut）。
     let (dir_a, _pa) = n_library_dir(cx, 3);
     let (dir_b, _pb) = n_library_dir(cx, 4);
@@ -4060,21 +4061,23 @@ async fn switching_music_dir_clears_session_recent(cx: &mut TestAppContext) {
     });
     assert!(
         !wcx.cx.read(|app| player.read(app).recent().is_empty()),
-        "播放后应有会话历史"
+        "播放后应有播放历史"
     );
-    // 换库（load_dir 换成另一目录）：清空是 load_dir 起始处的同步动作，断言无需等扫库完成。
+    // 换库（load_dir 换成另一目录）：recent 不再被清空，跨切库持久保留
+    //（判别式：加回 load_dir 里的 recent.clear() = 红）。
     wcx.update(|_w, app| {
         player.update(app, |p, cx| p.load_dir(&dir_b, cx));
     });
     assert!(
-        wcx.cx.read(|app| player.read(app).recent().is_empty()),
-        "切换音乐库目录后会话播放历史应清空"
+        !wcx.cx.read(|app| player.read(app).recent().is_empty()),
+        "切换音乐库目录后最近播放应持久保留（不被清空）"
     );
 }
 
-/// 占位不变式：「本地下载/发现/电台」仍为 ComingSoon——点击弹 toast、不切分区。
+/// 新导航项真实化：「发现/电台/本地下载」点击切换对应分区（不再弹「即将到来」toast）。
+/// 判别式：改回 ComingSoon 弹 toast = 红。
 #[gpui::test]
-async fn placeholder_nav_items_still_toast_coming_soon(cx: &mut TestAppContext) {
+async fn new_nav_items_open_real_sections(cx: &mut TestAppContext) {
     let player = player_with_library(cx);
     let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
     wcx.update(|window, app| {
@@ -4082,13 +4085,13 @@ async fn placeholder_nav_items_still_toast_coming_soon(cx: &mut TestAppContext) 
     });
     wcx.run_until_parked();
     for (label, sel, expected) in [
-        ("本地下载", "music-nav-本地下载", "本地下载即将到来"),
-        ("发现", "music-nav-发现", "发现即将到来"),
-        ("电台", "music-nav-电台", "电台即将到来"),
+        ("发现", "music-nav-发现", MainSection::Discover),
+        ("电台", "music-nav-电台", MainSection::Radio),
+        ("本地下载", "music-nav-本地下载", MainSection::Downloads),
     ] {
         let nav = wcx
             .debug_bounds(sel)
-            .expect("占位导航项应物化");
+            .expect("导航项应物化");
         let pos = gpui::Point::new(
             px(nav.origin.x.as_f32() + 40.0),
             px(nav.origin.y.as_f32() + nav.size.height.as_f32() * 0.5),
@@ -4096,17 +4099,214 @@ async fn placeholder_nav_items_still_toast_coming_soon(cx: &mut TestAppContext) 
         wcx.simulate_mouse_down(pos, MouseButton::Left, Default::default());
         wcx.simulate_mouse_up(pos, MouseButton::Left, Default::default());
         wcx.run_until_parked();
+        let sec = wcx.cx.read(|app| view.read(app).state.section);
+        assert_eq!(sec, expected, "点击「{label}」应切到 {expected:?} 分区");
         let toast = wcx
             .cx
             .read(|app| view.read(app).toast.as_ref().map(|(s, _)| s.to_string()));
-        assert_eq!(
-            toast.as_deref(),
-            Some(expected),
-            "点击「{label}」应弹「{expected}」toast"
+        assert!(
+            toast.as_deref().map_or(true, |s| !s.contains("即将到来")),
+            "「{label}」不应再弹「即将到来」toast"
         );
-        let sec = wcx.cx.read(|app| view.read(app).state.section);
-        assert_eq!(sec, MainSection::Home, "「{label}」占位项不应切换分区");
     }
+}
+
+/// 歌单详情：点侧栏歌单项 → `section == Playlist(i)`、横幅标题 + N首 + 组内曲目行物化。
+#[gpui::test]
+async fn playlist_sidebar_opens_detail(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // mix_groups[0] = 周杰伦（首现艺术家）。
+    let item = wcx
+        .debug_bounds("music-playlist-周杰伦")
+        .expect("侧栏歌单项应物化");
+    let pos = gpui::Point::new(
+        px(item.origin.x.as_f32() + 30.0),
+        px(item.origin.y.as_f32() + item.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_mouse_down(pos, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(pos, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let sec = wcx.cx.read(|app| view.read(app).state.section);
+    assert_eq!(sec, MainSection::Playlist(0), "点歌单应切到 Playlist(0)");
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("playlist-banner-周杰伦").is_some(),
+        "歌单横幅应物化（标题）"
+    );
+    assert!(
+        wcx.debug_bounds("song-row-0").is_some(),
+        "歌单内曲目行应物化（库下标 0）"
+    );
+    // 横幅「N首」：显示模型计数 = 组内曲目数（周杰伦组 1 首）。
+    let cached = wcx.cx.read(|app| {
+        view.read(app)
+            .main_list_cache
+            .get(&(MainSection::Playlist(0), String::new()))
+            .map(|(_r, l)| l.total)
+    });
+    assert_eq!(cached, Some(1), "歌单 0 应含 1 首命中行（N首计数）");
+}
+
+/// 本地下载：列全库全部曲目；设搜索词后行数按关键词收敛（无 like 过滤）。
+/// 判别式：移除过滤（行数不随之收敛）= 红。
+#[gpui::test]
+async fn downloads_lists_all_and_filters(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 10);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Downloads);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let total = wcx.cx.read(|app| {
+        view.read(app)
+            .main_list_cache
+            .get(&(MainSection::Downloads, String::new()))
+            .map(|(_r, l)| l.total)
+    });
+    assert_eq!(total, Some(10), "下载区应列全库 10 首");
+    // 搜索「艺人1」→ 10 首中每艺人 2 首，艺人1 恰 2 首收敛。
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.search = "艺人1".into());
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let narrowed = wcx.cx.read(|app| {
+        view.read(app)
+            .main_list_cache
+            .get(&(MainSection::Downloads, "艺人1".to_string()))
+            .map(|(_r, l)| l.total)
+    });
+    assert_eq!(narrowed, Some(2), "搜索「艺人1」应收敛到 2 首");
+}
+
+/// 发现：艺术家网格行 / 猜你喜欢行 / 最近添加行均物化（先播放种 recent → 推荐非空）。
+#[gpui::test]
+async fn discover_artist_grid_and_recent(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    // 播放一首（种 recent → 猜你喜欢 = liked∪recent 艺术家非空）。
+    wcx.update(|_w, app| {
+        view.update(app, |v, cx| v.handle_play_idx(0, cx));
+    });
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Discover);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("discover-artist-row").is_some(),
+        "艺术家网格行应物化"
+    );
+    assert!(
+        wcx.debug_bounds("discover-guess-row").is_some(),
+        "猜你喜欢行应物化（recent 非空）"
+    );
+    assert!(
+        wcx.debug_bounds("discover-recent-row").is_some(),
+        "最近添加行应物化（按 mtime 倒序）"
+    );
+}
+
+/// 歌单行点击播放：点组内第 k 行 → `player.current() == 对应库下标`（非组内序号/全局位置）。
+/// 判别式：错映射（用组内序号或全局序当库下标）= 红。
+#[gpui::test]
+async fn playlist_row_click_plays_correct_idx(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 8);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 库按文件名排序：艺人1 组（组下标 1，首现顺序第 2 组）曲目 = 库下标 [2,3]。
+    let item = wcx
+        .debug_bounds("music-playlist-艺人1")
+        .expect("侧栏歌单项应物化");
+    let pos = gpui::Point::new(
+        px(item.origin.x.as_f32() + 30.0),
+        px(item.origin.y.as_f32() + item.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_mouse_down(pos, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(pos, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).state.section),
+        MainSection::Playlist(1)
+    );
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 组内第 2 行 = 库下标 3（组内序号 1 ≠ 库下标 3）。
+    let r = wcx
+        .debug_bounds("song-row-3")
+        .expect("组内第二首(库下标3)行应物化");
+    let pos = gpui::Point::new(
+        px(r.origin.x.as_f32() + 30.0),
+        px(r.origin.y.as_f32() + r.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_mouse_down(pos, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(pos, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    let cur = wcx.cx.read(|app| player.read(app).current());
+    assert_eq!(cur, Some(3), "点组内第 2 行应播放库下标 3（非组内序号 1）");
+    // 组内首行 = 库下标 2（组内序号 0）——再证映射按库下标。
+    let r0 = wcx
+        .debug_bounds("song-row-2")
+        .expect("组内首行(库下标2)行应物化");
+    let pos = gpui::Point::new(
+        px(r0.origin.x.as_f32() + 30.0),
+        px(r0.origin.y.as_f32() + r0.size.height.as_f32() * 0.5),
+    );
+    wcx.simulate_mouse_down(pos, MouseButton::Left, Default::default());
+    wcx.simulate_mouse_up(pos, MouseButton::Left, Default::default());
+    wcx.run_until_parked();
+    assert_eq!(
+        wcx.cx.read(|app| player.read(app).current()),
+        Some(2),
+        "点组内首行应播放库下标 2（非组内序号 0）"
+    );
+}
+
+/// 电台漏斗：进 Radio 分区 → `player.radio()==true`（非空库开始播放）；离开 → `false`。
+/// 判别式：撤 set_section 漏斗 = 红。
+#[gpui::test]
+async fn radio_section_toggle_start_stop(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 5);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    assert!(
+        !wcx.cx.read(|app| player.read(app).radio()),
+        "初始电台应关闭"
+    );
+    // 进 Radio → start_radio。
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.set_section(MainSection::Radio, cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let (on, cur) = wcx
+        .cx
+        .read(|app| (player.read(app).radio(), player.read(app).current()));
+    assert_eq!(on, true, "进入电台分区应开启电台模式");
+    assert!(cur.is_some(), "非空库进入电台应开始播放（current 置位）");
+    // 离开 Radio → stop_radio。
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.set_section(MainSection::Home, cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(
+        !wcx.cx.read(|app| player.read(app).radio()),
+        "离开电台分区应关闭电台模式"
+    );
 }
 
 // ---- 换肤子菜单（阶段②入口：写选择进 music_skin + persist；取色渲染在阶段③接入） ----
@@ -4612,4 +4812,178 @@ async fn skin_popup_panel_uses_global_theme_surface(cx: &mut TestAppContext) {
         !frame_has_quad_like(wcx, surface_rgb, panel_alpha),
         "菜单关闭后音乐窗帧内应不再有全局亮 surface 面板色"
     );
+}
+
+/// C4 分享真实化：`share_current` 把「{title} - {artist}」写剪贴板 + toast。
+/// 无当前曲 → 只提示、剪贴板保持原值（不误写）。剪贴板经 headless 平台读写（真机待验）。
+#[gpui::test]
+async fn share_copies_title_dash_artist(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+
+    // 无当前曲：置剪贴板旧值，分享应只提示「暂无正在播放的歌曲」、不覆盖剪贴板。
+    wcx.write_to_clipboard(gpui::ClipboardItem::new_string("旧值".to_string()));
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.share_current(window, cx));
+    });
+    wcx.run_until_parked();
+    let toast0 = wcx
+        .cx
+        .read(|app| view.read(app).toast.as_ref().map(|(s, _)| s.to_string()));
+    let clip0 = wcx.read_from_clipboard().and_then(|c| c.text());
+    assert!(
+        toast0.as_deref().unwrap_or_default().contains("暂无正在播放"),
+        "无当前曲应提示「暂无正在播放的歌曲」"
+    );
+    assert_eq!(clip0.as_deref(), Some("旧值"), "无当前曲不应改写剪贴板");
+
+    // 播放第 0 首（周杰伦 - 晴天）→ 分享 → 剪贴板 == 「晴天 - 周杰伦」+ 已复制 toast。
+    wcx.cx.update(|app| {
+        player.update(app, |p, cx| p.play_track(0, cx));
+    });
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.share_current(window, cx));
+    });
+    wcx.run_until_parked();
+    let toast1 = wcx
+        .cx
+        .read(|app| view.read(app).toast.as_ref().map(|(s, _)| s.to_string()));
+    let clip1 = wcx.read_from_clipboard().and_then(|c| c.text());
+    assert_eq!(
+        clip1.as_deref(),
+        Some("晴天 - 周杰伦"),
+        "分享应把「<title> - <artist>」写入剪贴板"
+    );
+    assert!(
+        toast1.as_deref().unwrap_or_default().contains("已复制：晴天 - 周杰伦"),
+        "应有「已复制：<title> - <artist>」toast"
+    );
+}
+
+/// C4 打开所在文件夹真实化：`reveal_current` 对「已不存在路径」只 toast、不 panic、
+/// 不开 Explorer（存在性预检路径，确定性无侧效；真实 Explorer 弹出真机待验）。
+#[gpui::test]
+async fn reveal_current_errors_toast_no_panic(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+
+    // 无当前曲：只提示、不 panic。
+    wcx.update(|_window, app| {
+        view.update(app, |v, cx| v.reveal_current(cx));
+    });
+    wcx.run_until_parked();
+    let toast0 = wcx
+        .cx
+        .read(|app| view.read(app).toast.as_ref().map(|(s, _)| s.to_string()));
+    assert!(
+        toast0.as_deref().unwrap_or_default().contains("暂无正在播放"),
+        "无当前曲应提示「暂无正在播放的歌曲」"
+    );
+
+    // 播放曲目后删掉其文件 → reveal_current 走「文件不存在」错误提示、不 panic。
+    wcx.cx.update(|app| {
+        player.update(app, |p, cx| p.play_track(0, cx));
+    });
+    let path0 = wcx.cx.read(|app| player.read(app).library()[0].path.clone());
+    let _ = std::fs::remove_file(&path0);
+    wcx.update(|_window, app| {
+        view.update(app, |v, cx| v.reveal_current(cx));
+    });
+    wcx.run_until_parked();
+    let toast1 = wcx
+        .cx
+        .read(|app| view.read(app).toast.as_ref().map(|(s, _)| s.to_string()));
+    assert!(
+        toast1.as_deref().unwrap_or_default().contains("无法在资源管理器中显示"),
+        "文件不存在应提示「无法在资源管理器中显示」"
+    );
+}
+
+/// C4 加入队列真实化（去重 + 当前曲诚实）：行级 `song-que-{k}`（非当前行）→ 把 k 插到
+/// 下一首位且不重复；右栏/全屏「加入队列」作用于当前曲 → 诚实提示「已在队列」、队列不变
+/// （判别式：断言旧 bug「当前曲插下一首」= 红；行级入口负责真实加入）。
+#[gpui::test]
+async fn add_to_queue_button_places_next(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 播放第 0 首（当前=0，队列=[0,1,2]）。
+    wcx.cx.update(|app| {
+        player.update(app, |p, cx| p.play_track(0, cx));
+    });
+    // 切到「本地下载」区（歌行紧贴顶部，行级按钮稳定物化）。
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.section = MainSection::Downloads);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+
+    // 行级真加入：点非当前行 song-que-2（k=2 ≠ current=0）→ 插到下一首位且 k 只出现一次。
+    click_button(wcx, "song-que-2");
+    let (q, qpos) = wcx.cx.read(|app| {
+        let p = player.read(app);
+        (p.queue().to_vec(), p.queue_pos())
+    });
+    assert_eq!(q[qpos + 1], 2, "行级「加入队列」应把非当前曲插到下一首位");
+    assert_eq!(q.iter().filter(|&&x| x == 2).count(), 1, "队列不应含 2 的重复项");
+
+    // 当前曲钮诚实：点右栏 right-que（作用于 current=0）→ 诚实 toast、队列不变、qpos 正确。
+    click_button(wcx, "right-que");
+    let toast = wcx
+        .cx
+        .read(|app| view.read(app).toast.as_ref().map(|(s, _)| s.to_string()));
+    assert_eq!(
+        toast.as_deref(),
+        Some("当前歌曲已在播放队列中"),
+        "右栏「加入队列」应诚实提示当前曲已在队列"
+    );
+    let (q2, qpos2) = wcx.cx.read(|app| {
+        let p = player.read(app);
+        (p.queue().to_vec(), p.queue_pos())
+    });
+    assert_eq!(q2.len(), q.len(), "对当前曲点「加入队列」应 no-op（队列长不变）");
+    assert_eq!(q2[qpos2], 0, "对当前曲点「加入队列」后 current 真位不变");
+
+    // 再点一次 → 仍诚实、队列不变。
+    click_button(wcx, "right-que");
+    let (q3, qpos3) = wcx.cx.read(|app| {
+        let p = player.read(app);
+        (p.queue().to_vec(), p.queue_pos())
+    });
+    assert_eq!(q3.len(), q2.len(), "重复点当前曲钮不应叠加项");
+    assert_eq!(q3[qpos3], 0, "重复点当前曲钮 qpos 仍指向 current");
+
+    // 全屏：播放第 1 首后点 fs-que → 诚实提示、队列不变（fs 也作用于 current）。
+    wcx.cx.update(|app| {
+        view.update(app, |v, _| v.state.fs_open = true);
+    });
+    wcx.cx.update(|app| {
+        player.update(app, |p, cx| p.play_track(1, cx));
+    });
+    wcx.update(|window, app| {
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    click_button(wcx, "fs-que");
+    let toast_fs = wcx
+        .cx
+        .read(|app| view.read(app).toast.as_ref().map(|(s, _)| s.to_string()));
+    assert_eq!(
+        toast_fs.as_deref(),
+        Some("当前歌曲已在播放队列中"),
+        "全屏「加入队列」应诚实提示当前曲已在队列"
+    );
+    let (q4, qpos4) = wcx.cx.read(|app| {
+        let p = player.read(app);
+        (p.queue().to_vec(), p.queue_pos())
+    });
+    assert_eq!(q4[qpos4], 1, "全屏 current=1 真位不变");
+    assert_eq!(q4.len(), q3.len(), "全屏对当前曲点「加入队列」应 no-op");
 }

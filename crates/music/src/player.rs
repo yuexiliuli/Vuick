@@ -64,6 +64,11 @@ pub struct MusicPlayer {
     paused: bool,
     repeat: RepeatMode,
     shuffle: bool,
+    /// 私人电台模式：EOF 后自动随机续播下一首（绕过 repeat=Off 队尾停语义），永不停止。
+    /// 会话态不持久化；`stop_radio` 只翻标志，不扰队列/当前曲。
+    radio: bool,
+    /// 电台随机种子（确定性 xorshift，`radio_next_index` 推进）。
+    radio_seed: u64,
     volume: f32,
     sink: Option<AudioSink>,
     worker_tx: Option<mpsc::Sender<WorkerCmd>>,
@@ -128,8 +133,9 @@ pub struct MusicPlayer {
     /// `play_path` 待播路径：目标不在当前库时以父目录异步重扫，扫完在 `commit_scan` 中按路径
     /// 重定位并播放（保持「播放外部文件」语义不被异步化打断）。
     pending_path: Option<PathBuf>,
-    /// 本次会话播放历史（仅内存、不持久化）：会话内「真正开始播放/切换曲目」的曲目路径，
-    /// 最近先、同一曲去重后置顶。`load_dir`（首次打开/换库重扫）时清空——不跨库/跨会话保留。
+    /// 播放历史（跨重启 + 跨切库持久化，与收藏同语义）：真正开始播放/切换曲目的路径，
+    /// 最近先、同一曲去重后置顶。`new`/`apply_saved_prefs` 从 `music_recent` 恢复、
+    /// `flush_prefs` 统一落盘；`load_dir` 换库不再清空（旧库路径按当前库解析不显示、无污染）。
     recent: Vec<String>,
 }
 
@@ -154,6 +160,8 @@ impl MusicPlayer {
             paused: false,
             repeat: RepeatMode::Off,
             shuffle: false,
+            radio: false,
+            radio_seed: 0x9e37_79b9_7f4a_7c15,
             volume: prefs.music_volume.unwrap_or(1.0).clamp(0.0, 1.0),
             sink: None,
             worker_tx: None,
@@ -181,7 +189,7 @@ impl MusicPlayer {
             scanning: false,
             scan_gen: 0,
             pending_path: None,
-            recent: Vec::new(),
+            recent: prefs.music_recent,
         }
     }
 
@@ -260,9 +268,9 @@ impl MusicPlayer {
     /// 重定位（重扫后下标可能漂移）。不打断播放。换目录重扫由 `scan_gen` 作废旧结果（防竞态）。
     pub fn load_dir(&mut self, dir: impl AsRef<Path>, cx: &mut Context<Self>) {
         let dir = dir.as_ref().to_path_buf();
-        // 换库/首次装载 = 新会话起点：本次会话播放历史清空（最近播放不跨库/跨会话保留），
-        // 并递增 mutation 令视图侧「最近播放」显示模型缓存立即失效（不显示旧历史）。
-        self.recent.clear();
+        // 换库/首次装载 = 新会话起点：递增 mutation 令视图侧「最近播放」显示模型缓存失效。
+        // 最近播放本身跨切换库持久保留（与收藏同语义，按路径解析——旧库路径在当前库自然
+        // 不显示，无污染；Recent 分区仅展示仍存在于当前库的路径）。
         self.mutation += 1;
         self.scanning = true;
         self.scan_gen = self.scan_gen.wrapping_add(1);
@@ -415,6 +423,7 @@ impl MusicPlayer {
         self.set_volume(prefs.music_volume.unwrap_or(1.0), cx);
         self.liked = prefs.music_liked.iter().cloned().collect();
         self.liked_order = prefs.music_liked.clone();
+        self.recent = prefs.music_recent.clone();
         self.pending_restore = Some((prefs.music_last_track.clone(), prefs.music_progress_secs));
     }
 
@@ -489,6 +498,7 @@ impl MusicPlayer {
         prefs.music_last_track = self.last_track_pref.clone();
         prefs.music_progress_secs = self.progress_pref;
         prefs.music_liked = self.liked_order.clone();
+        prefs.music_recent = self.recent.clone();
         if !cfg!(test) {
             prefs.save();
         }
@@ -703,6 +713,69 @@ impl MusicPlayer {
         };
         self.queue_pos = pos;
         self.play_track(idx, cx);
+    }
+
+    /// 把 `library[idx]` 加入队列「当前曲之后」（下一首播放，不打断当前播放）。
+    /// - `idx` 越界 → 空操作；
+    /// - `queue` 空 → 照 `play_track` 先建全库队列（shuffle 则洗牌）；
+    /// - `idx == current`（按「加入队列」作用于正在播放的曲目）→ 无操作：current 自身槽
+    ///   保留（删掉会致 `queue_pos` 错位）、自身已唯一，只校准 `queue_pos` = current 真位；
+    /// - 其它 → 去重（`idx` 只保留一个）后再把 `idx` 插到 `current` 之后（无 `current` → 队首）。
+    /// 不 bump `mutation`（Queue tab 渲染期实时读 `queue()`，notify 即驱动重绘）。
+    pub fn add_to_queue_next(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.library.len() {
+            return;
+        }
+        if self.queue.is_empty() {
+            let mut q: Vec<usize> = (0..self.library.len()).collect();
+            if self.shuffle {
+                shuffle_in_place(&mut q);
+            }
+            self.queue = q;
+        }
+        // `idx == current`：**不删 current 自身槽、也不插自身**。删掉后按 current 重算
+        // `queue_pos` 会查不到 → `unwrap_or(0)` 指错位（例：queue=[0,1,2], current=0 加 0 →
+        // 去重 [1,2]→queue_pos=0→queue[1]==0，Queue tab 高亮错行、next/自动推进从错位走；
+        // 评审 A④）。插自身到自身之后又造重复。正确语义 = 无操作 + 校准 queue_pos。
+        // 判别式：任意库态下 `queue[queue_pos] == current`（current.is_some() 时）。
+        if Some(idx) == self.current {
+            self.queue_pos = self
+                .current
+                .and_then(|c| self.queue.iter().position(|&x| x == c))
+                .unwrap_or(0);
+            cx.notify();
+            return;
+        }
+        self.queue.retain(|x| x != &idx);
+        // 插入位 = current 在（去重后）队列的下标之后（retain 未动 current，位置即真位）；
+        // 无 `current` → 队首 0。
+        self.queue_pos = self
+            .current
+            .and_then(|c| self.queue.iter().position(|&x| x == c))
+            .unwrap_or(0);
+        self.queue.insert((self.queue_pos + 1).min(self.queue.len()), idx);
+        cx.notify();
+    }
+
+    /// 进入私人电台模式：置 `radio=true`；若当前未播放且库非空 → 随机播一首
+    /// （`radio_next_index` 选曲，直接 `play_track`）。只翻标志，不动队列/当前曲。
+    pub fn start_radio(&mut self, cx: &mut Context<Self>) {
+        self.radio = true;
+        if self.playing || self.library.is_empty() {
+            return;
+        }
+        let n = radio_next_index(self.library.len(), self.current, &mut self.radio_seed);
+        self.play_track(n, cx);
+    }
+
+    /// 退出私人电台模式：只翻标志，不清播放/队列/当前曲；之后 EOF 走既有 repeat 语义。
+    pub fn stop_radio(&mut self) {
+        self.radio = false;
+    }
+
+    /// 私人电台模式是否开启（会话态，不持久化）。
+    pub fn radio(&self) -> bool {
+        self.radio
     }
 
     /// 播放指定路径的音频文件（shell 集成入口）：先在当前 library 里按路径找下标；
@@ -959,7 +1032,7 @@ impl MusicPlayer {
         &self.liked
     }
 
-    /// 本次会话播放历史（最近先；空 = 无记录）。仅内存、不持久化，`load_dir` 时清空。
+    /// 播放历史（最近先；跨重启 + 跨切库持久化，与收藏同语义）。
     pub fn recent(&self) -> &[String] {
         &self.recent
     }
@@ -970,8 +1043,21 @@ impl MusicPlayer {
         self.recent.insert(0, path);
     }
 
-    /// 播完自动推进：按 repeat 决定下一首；`Off`（含 shuffle）队尾 → 停（不再自动播）。
+    /// 播完自动推进：`radio`（私人电台）下**永不停止**随机续播（EOF 才触发——手动
+    /// next/prev 走 `play_track` 不经此），库空才停；否则按 repeat 决定下一首；
+    /// `Off`（含 shuffle）队尾 → 停（不再自动播）。
     fn auto_advance(&mut self, cx: &mut Context<Self>) {
+        // 电台分支优先：绕过 repeat=Off 的「队尾 None→停」语义，随机选下一首
+        //（`radio_next_index` 保证 ≠ 当前），实现「永不停止随机自动播」。
+        if self.radio {
+            if self.library.is_empty() {
+                self.playing = false;
+                return;
+            }
+            let n = radio_next_index(self.library.len(), self.current, &mut self.radio_seed);
+            self.play_track(n, cx);
+            return;
+        }
         if self.queue.is_empty() {
             if !self.library.is_empty() {
                 return self.play_track(0, cx);
@@ -1069,6 +1155,30 @@ pub fn advance_on_finish(
         RepeatMode::One => Some(pos),
         RepeatMode::Off => (pos + 1 < queue_len).then_some(pos + 1),
         RepeatMode::All => Some((pos + 1) % queue_len),
+    }
+}
+
+/// 电台随机下标（确定性 xorshift64）：从 `seed` 推进出随机值映射到 `[0, lib_len)`。
+/// - `lib_len == 0` → 0（调用方保证库非空才调，此处兜底）；
+/// - `lib_len == 1` → 恒 0；
+/// - `lib_len > 1` 且 `current.is_some()` → 结果 ≠ `current`（避免立即重播同一首）。
+/// 同一 `seed` 起点 → 相同随机序列（可复现、可单测）。xorshift 在状态 0 时卡死，
+/// 函数内遇到 0 先自动重播种。
+pub fn radio_next_index(lib_len: usize, current: Option<usize>, seed: &mut u64) -> usize {
+    if lib_len == 0 || lib_len == 1 {
+        return 0;
+    }
+    if *seed == 0 {
+        *seed = 0x9e37_79b9_7f4a_7c15;
+    }
+    loop {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let n = (*seed % lib_len as u64) as usize;
+        if Some(n) != current {
+            return n;
+        }
     }
 }
 
@@ -1345,6 +1455,250 @@ mod tests {
         assert_eq!(s, orig, "洗牌只重排、不丢不重元素");
         // 20 元素洗牌结果几乎必变序（确定性伪随机也几乎必变）
         assert_ne!(q, orig);
+    }
+
+    #[test]
+    fn radio_next_index_pure() {
+        // lib_len == 1 → 恒 0
+        let mut s = 1u64;
+        assert_eq!(radio_next_index(1, Some(0), &mut s), 0);
+        assert_eq!(radio_next_index(1, None, &mut s), 0);
+        // lib_len == 0 → 兜底 0（不 panic）
+        let mut s0 = 5u64;
+        assert_eq!(radio_next_index(0, None, &mut s0), 0);
+        // lib_len > 1 且 current=Some → 结果 ≠ current 且在界内
+        let mut s = 12345u64;
+        for _ in 0..50 {
+            let n = radio_next_index(5, Some(2), &mut s);
+            assert!(n < 5, "结果应在 [0,5)，实得 {n}");
+            assert_ne!(n, 2, "电台不得立即重播当前曲");
+        }
+        // 固定 seed 起点 → 序列确定（可复现）
+        let mut a = 0xdead_beefu64;
+        let mut b = 0xdead_beefu64;
+        let seq_a: Vec<usize> = (0..8).map(|_| radio_next_index(7, None, &mut a)).collect();
+        let seq_b: Vec<usize> = (0..8).map(|_| radio_next_index(7, None, &mut b)).collect();
+        assert_eq!(seq_a, seq_b, "同 seed 序列必须一致");
+        assert!(seq_a.iter().all(|&n| n < 7), "结果应在 [0,7)");
+        // seed==0（xorshift 卡死）应被自动重播种，不卡死、界内
+        let mut z = 0u64;
+        assert!(radio_next_index(3, None, &mut z) < 3);
+        assert_ne!(z, 0, "0 种子应被自动重播种");
+    }
+
+    /// `add_to_queue_next`：建库播放 A 后把 B 加入「当前曲之后」——B 插在 `queue_pos+1`、
+    /// 只出现一次（去重）；重复 add 同一首不重复入列；queue 空时先建全库队列再插。
+    #[gpui::test]
+    async fn add_to_queue_next_places_after_current(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("gpui-music-qnext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_test_wav(&dir.join("甲 - one.wav"), 1.5);
+        write_test_wav(&dir.join("乙 - two.wav"), 1.5);
+        write_test_wav(&dir.join("丙 - three.wav"), 1.5);
+        let player: gpui::Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let i0 = cx.read(|app| {
+            let p = player.read(app);
+            p.library().iter().position(|t| t.title == "one").unwrap()
+        });
+        let i1 = cx.read(|app| {
+            let p = player.read(app);
+            p.library().iter().position(|t| t.title == "two").unwrap()
+        });
+        let i2 = cx.read(|app| {
+            let p = player.read(app);
+            p.library().iter().position(|t| t.title == "three").unwrap()
+        });
+        assert_ne!((i0, i1, i2), (i1, i2, i0), "测试曲目下标应互异");
+        // 播放 A（纯状态，不发设备）。
+        cx.update(|app| player.update(app, |p, _| p.test_start_playing(i0)));
+        // add B → B 在 current 后一位、只出现一次。
+        cx.update(|app| player.update(app, |p, cx| p.add_to_queue_next(i1, cx)));
+        let (qpos, q) = cx.read(|app| {
+            let p = player.read(app);
+            (p.queue_pos, p.queue().to_vec())
+        });
+        assert_eq!(q.iter().filter(|&&x| x == i1).count(), 1, "B 去重后应只出现一次");
+        let b_pos = q.iter().position(|&x| x == i1).unwrap();
+        assert_eq!(b_pos, qpos + 1, "B 应插在 current 后一位（queue[{qpos}] 后）");
+        // 重复 add 同一首 → 去重后仍在 current 后一位、不重复入列。
+        cx.update(|app| player.update(app, |p, cx| p.add_to_queue_next(i1, cx)));
+        let (qpos2, q2) = cx.read(|app| {
+            let p = player.read(app);
+            (p.queue_pos, p.queue().to_vec())
+        });
+        assert_eq!(q2.iter().filter(|&&x| x == i1).count(), 1, "重复 add 不重复入列");
+        let b2 = q2.iter().position(|&x| x == i1).unwrap();
+        assert_eq!(b2, qpos2 + 1);
+        // queue 空：先建全库队列再插（仍紧随 current）。
+        cx.update(|app| player.update(app, |p, _| p.queue = Vec::new()));
+        cx.update(|app| player.update(app, |p, cx| p.add_to_queue_next(i2, cx)));
+        let q3 = cx.read(|app| player.read(app).queue().to_vec());
+        assert_eq!(q3.len(), 3, "queue 空时先建全库队列");
+        assert_eq!(q3.iter().filter(|&&x| x == i2).count(), 1);
+        let c_pos = q3.iter().position(|&x| x == i0).unwrap();
+        let b3 = q3.iter().position(|&x| x == i2).unwrap();
+        assert_eq!(b3, c_pos + 1, "queue 空路径下 C 也应插在 current 后一位");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归（评审 A④）：`add_to_queue_next` 加**当前曲**（`idx == current`——「加入队列」按钮
+    /// `add_to_queue_current` 正是作用于正在播放的曲目 → 主流程必现）时，旧实现 `retain` 把
+    /// current 自身槽删掉 → 其后按 current 重算 `queue_pos` 查不到 → `unwrap_or(0)` 指错位
+    /// （例：queue=[0,1,2], current=0 加 0 → 去重 [1,2]、queue_pos=0，但 queue[1]==0）。
+    /// 判别：**`queue[queue_pos] == current` 必须成立**（评审强调「qpos == current 真位」断言，
+    /// 不是「q[qpos+1]」那种同源自洽）；加非当前曲 B 时去重语义保留（B 只一次、排在 A 后）。
+    /// 撤掉修复（删 current 槽）→ 本测试红。
+    #[gpui::test]
+    async fn add_to_queue_current_keeps_pos_when_adding_current(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("gpui-music-qcur-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_test_wav(&dir.join("甲 - one.wav"), 1.5);
+        write_test_wav(&dir.join("乙 - two.wav"), 1.5);
+        write_test_wav(&dir.join("丙 - three.wav"), 1.5);
+        let player: gpui::Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let i0 = cx.read(|app| {
+            let p = player.read(app);
+            p.library().iter().position(|t| t.title == "one").unwrap()
+        });
+        let i1 = cx.read(|app| {
+            let p = player.read(app);
+            p.library().iter().position(|t| t.title == "two").unwrap()
+        });
+        let i2 = cx.read(|app| {
+            let p = player.read(app);
+            p.library().iter().position(|t| t.title == "three").unwrap()
+        });
+        // 播放 A（纯状态，不发设备）。
+        cx.update(|app| player.update(app, |p, _| p.test_start_playing(i0)));
+        // 加当前曲本身：不得删 current 槽、不得造重复；queue_pos 必须仍指向 current 真位。
+        cx.update(|app| player.update(app, |p, cx| p.add_to_queue_next(i0, cx)));
+        let (qpos, q) = cx.read(|app| {
+            let p = player.read(app);
+            (p.queue_pos, p.queue().to_vec())
+        });
+        assert_eq!(
+            q.get(qpos).copied(),
+            Some(i0),
+            "判别：queue[{qpos}] 必须仍是 current({i0})，实得 {:?}（加当前曲不得错位）",
+            q.get(qpos)
+        );
+        assert_eq!(q.iter().filter(|&&x| x == i0).count(), 1, "加当前曲不得重复入列");
+        assert_eq!(q.len(), 3, "加当前曲不应改变队列长度");
+        // 加非当前曲 B：B 只出现一次、排在 current 之后（去重语义保留）。
+        cx.update(|app| player.update(app, |p, cx| p.add_to_queue_next(i1, cx)));
+        let (qpos2, q2) = cx.read(|app| {
+            let p = player.read(app);
+            (p.queue_pos, p.queue().to_vec())
+        });
+        assert_eq!(q2[qpos2], i0, "加非当前曲后 queue_pos 仍应指向 current");
+        assert_eq!(q2.iter().filter(|&&x| x == i1).count(), 1, "B 去重后只出现一次");
+        let b_pos = q2.iter().position(|&x| x == i1).unwrap();
+        assert_eq!(b_pos, qpos2 + 1, "B 应排在 current 之后一位");
+        // 全库曲目各唯一（无重复污染）。
+        for idx in [i0, i1, i2] {
+            assert_eq!(q2.iter().filter(|&&x| x == idx).count(), 1, "曲目 {idx} 应唯一");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 电台自动推进：radio=true + 注入 EOF `Finished` → 每次 `current` 变化且 `playing` 恒
+    /// true（不再落 repeat=Off 队尾停）；库空 → playing=false。
+    /// 判别式：撤掉 `auto_advance` 的 radio 分支 = repeat=Off 队尾 None→playing=false = 红。
+    #[gpui::test]
+    async fn radio_finished_advances_forever_random(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("gpui-music-radio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_test_wav(&dir.join("甲 - one.wav"), 1.5);
+        write_test_wav(&dir.join("乙 - two.wav"), 1.5);
+        write_test_wav(&dir.join("丙 - three.wav"), 1.5);
+        let player: gpui::Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        assert_eq!(cx.read(|app| player.read(app).library().len()), 3);
+        // 播放中 current=1 + radio 开，注入 EOF：每次 current 变化、playing 恒 true。
+        cx.update(|app| {
+            player.update(app, |p, _| {
+                p.test_start_playing(1);
+                p.generation = 42;
+                p.radio = true;
+            });
+        });
+        // 注入通道：换入测试持 send 端的事件通道（K182 姿势，同 bug_a 测试）。注意 `play_track`
+        // 打开真实 sink 会经 `spawn_worker` 换掉 evt_rx（丢弃注入读端），故每轮重建通道并重新
+        // 挂接，保证「注入 Finished → 消费」与真机设备是否在场无关。
+        let (mut tx, mut rx) = std::sync::mpsc::channel::<Event>();
+        let mut prev = 1usize;
+        for _ in 0..6 {
+            cx.update(|app| player.update(app, |p, _| p.evt_rx = rx));
+            let gen_cur = cx.read(|app| player.read(app).generation);
+            tx.send(Event::Finished { gen_id: gen_cur }).unwrap();
+            cx.update(|app| player.update(app, |p, cx| p.tick(cx)));
+            let (cur, playing) = cx.read(|app| {
+                let p = player.read(app);
+                (p.current, p.playing)
+            });
+            let cur = cur.expect("电台自动推进后应有 current");
+            assert_ne!(cur, prev, "电台随机推进不得重复上一首");
+            assert!(playing, "电台模式下播完自动推进，playing 恒 true");
+            prev = cur;
+            let (next_tx, next_rx) = std::sync::mpsc::channel::<Event>();
+            tx = next_tx;
+            rx = next_rx;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 库空：电台自动推进 → playing=false（不再随机播）。
+        let player2: gpui::Entity<MusicPlayer> = cx.update(|app| app.new(|cx| MusicPlayer::new(cx)));
+        let (tx2, rx2) = std::sync::mpsc::channel::<Event>();
+        cx.update(|app| {
+            player2.update(app, |p, _| {
+                p.evt_rx = rx2;
+                p.radio = true;
+            });
+        });
+        let gen0 = cx.read(|app| player2.read(app).generation);
+        tx2.send(Event::Finished { gen_id: gen0 }).unwrap();
+        cx.update(|app| player2.update(app, |p, cx| p.tick(cx)));
+        assert!(
+            !cx.read(|app| player2.read(app).playing()),
+            "库空时电台自动推进应停（playing=false）"
+        );
+    }
+
+    /// start/stop_radio：start 后 radio()==true 且非空库开始播放（current=Some、playing）；
+    /// stop 后 radio()==false 且 current/playing 不变（只翻标志）。
+    #[gpui::test]
+    async fn start_stop_radio(cx: &mut TestAppContext) {
+        let (dir, _p0, _p1, player) = two_track_library(cx, "radio-ss");
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        // start_radio：未播放 + 库非空 → 开始随机播。
+        cx.update(|app| player.update(app, |p, cx| p.start_radio(cx)));
+        let (radio, cur, playing) = cx.read(|app| {
+            let p = player.read(app);
+            (p.radio(), p.current(), p.playing())
+        });
+        assert!(radio, "start_radio 后 radio() 应为 true");
+        let cur = cur.expect("start_radio 应开始随机播");
+        assert!(cur < 2, "current 应在界内，实得 {cur}");
+        assert!(playing, "start_radio 后应 playing");
+        // stop_radio：只翻标志。
+        cx.update(|app| player.update(app, |p, _| p.stop_radio()));
+        let (radio2, cur2, playing2) = cx.read(|app| {
+            let p = player.read(app);
+            (p.radio(), p.current(), p.playing())
+        });
+        assert!(!radio2, "stop_radio 后 radio() 应为 false");
+        assert_eq!(cur2, Some(cur), "stop_radio 不清 current");
+        assert_eq!(playing2, playing, "stop_radio 不改 playing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 显示基准回归：`seek(T)` 后（有曲目时长、无 worker/sink）`position()≈T`（显示落到
@@ -2090,6 +2444,54 @@ mod tests {
         });
         assert!(is0, "启动时应把 music_liked 接线进 liked（按路径匹配）");
         assert_eq!(order, vec![p0s], "顺序镜像应与 prefs 一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// music_recent 启动接线：`apply_saved_prefs`（load_default_dir 入口）把 prefs 最近播放
+    /// 序恢复进 recent（新→旧序原样保留，与 liked 同语义）。
+    /// 判别式：移除 apply_saved_prefs 里的 `self.recent = prefs.music_recent.clone()` = 红。
+    #[gpui::test]
+    async fn apply_saved_prefs_restores_recent_order(cx: &mut TestAppContext) {
+        let (dir, p0, p1, player) = two_track_library(cx, "recent-open");
+        let p0s = p0.to_string_lossy().to_string();
+        let p1s = p1.to_string_lossy().to_string();
+        // 构造最近播放序（新→旧）：p1 最近、p0 次之。
+        let mut prefs = config::user::UserPrefs::default();
+        prefs.music_recent = vec![p1s.clone(), p0s.clone()];
+        cx.update(|app| player.update(app, |p, cx| p.apply_saved_prefs(&prefs, cx)));
+        let recent = cx.read(|app| player.read(app).recent().to_vec());
+        assert_eq!(recent, vec![p1s, p0s], "recent 应按 music_recent 新→旧序恢复");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// recent 变化标记持久化脏并统一 flush（K10）：`play_track` 把曲目压进 recent 并置脏，
+    /// `flush_prefs` 把 recent 并入预写盘（计数 +1、清脏）。测试态不真读回写结果
+    ///（真回写属 config crate roundtrip 职责，此处仅断言统一落盘口径）。
+    /// 判别式：flush_prefs 里去掉 `prefs.music_recent = self.recent.clone()` 不影响本测试
+    ///（探针级），但 recent 不置脏/不走统一 flush 即红。
+    #[gpui::test]
+    async fn recent_plays_mark_dirty_and_flush_probe(cx: &mut TestAppContext) {
+        let (dir, p0, _p1, player) = two_track_library(cx, "recent-flush");
+        cx.update(|app| player.update(app, |p, cx| p.load_dir(&dir, cx)));
+        drain_scan(cx);
+        let i0 = idx_of(&player, cx, &p0);
+        let p0s = p0.to_string_lossy().to_string();
+        cx.update(|app| player.update(app, |p, cx| p.play_track(i0, cx)));
+        let (dirty, count, recent) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_dirty, p.prefs_flush_count, p.recent().to_vec())
+        });
+        assert!(dirty, "播放压进 recent 应标记持久化脏");
+        assert_eq!(count, 0, "不散点直写");
+        assert_eq!(recent, vec![p0s], "播放曲目应进入 recent 首部");
+
+        cx.update(|app| player.update(app, |p, _| p.flush_prefs()));
+        let (count, dirty) = cx.read(|app| {
+            let p = player.read(app);
+            (p.prefs_flush_count, p.prefs_dirty)
+        });
+        assert_eq!(count, 1, "统一 flush 应恰好一次");
+        assert!(!dirty);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

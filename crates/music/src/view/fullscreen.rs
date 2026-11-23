@@ -121,7 +121,7 @@ impl super::MusicView {
                     .items_center()
                     .gap_x(px(12.))
                     .child(self.fs_icon_btn(IconName::PlaylistAdd, "已添加到播放列表", cx))
-                    .child(self.fs_icon_btn(IconName::Share, "分享链接已复制", cx)),
+                    .child(self.fs_icon_btn(IconName::Share, "分享", cx)),
             )
             .child(
                 div()
@@ -149,7 +149,11 @@ impl super::MusicView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let hovered = self.fs_hover == Some(tip);
-        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| this.toast_msg(tip, cx));
+        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| match tip {
+            // 顶栏分享钮真实化：真正写剪贴板 + toast（不再只弹假提示）。
+            "分享" => this.share_current(_w, cx),
+            _ => this.toast_msg(tip, cx),
+        });
         div()
             .id(format!("fs-btn-{tip}"))
             .relative()
@@ -767,13 +771,14 @@ impl super::MusicView {
                     );
                 }
             }
-            "fs-que" => this.toast_msg("已加入队列", cx),
-            "fs-dl" => this.toast_msg("下载功能即将到来", cx),
+            "fs-que" => this.add_to_queue_current(cx),
+            "fs-dl" => this.reveal_current(cx),
             _ => {}
         });
         div()
             .id(id)
             .relative()
+            .debug_selector(move || id.into())
             .w(px(20.))
             .h(px(20.))
             .flex()

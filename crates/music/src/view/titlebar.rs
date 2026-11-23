@@ -213,7 +213,7 @@ pub fn render(window: &mut Window, cx: &mut App) -> AnyElement {
                 .text_size(px(12.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme::text2())
-                .child("Orbitrum Player"),
+                .child("Vuick Music"),
         );
 
     // 中间空白拖动区：flex_1 吸满剩余宽度，与左块同为兄弟级 Drag 命中区（不覆盖按钮）。

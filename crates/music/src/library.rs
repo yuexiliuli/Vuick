@@ -68,6 +68,7 @@ fn track_from_path(path: PathBuf) -> Track {
     let grad = grad_from_hash(&format!("{artist} - {title}"));
     let lyrics = read_lrc_sidecar(&path);
     let cover_path = find_cover_sidecar(&path);
+    let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
     Track {
         path,
         title,
@@ -77,7 +78,14 @@ fn track_from_path(path: PathBuf) -> Track {
         grad,
         cover_path,
         lyrics,
+        mtime,
     }
+}
+
+/// 按文件修改时间倒序排列（最新在前）；`mtime` 为 `None`（未知）恒殿后；None 之间保持
+/// 原相对顺序（`sort_by` 是稳定排序，等键元素不换序）。
+pub fn sort_tracks_by_mtime_desc(tracks: &mut [Track]) {
+    tracks.sort_by(|a, b| b.mtime.cmp(&a.mtime));
 }
 
 /// 找歌曲旁同名封面图（`.jpg/.jpeg/.png/.webp`，扩展名大小写不敏感，按 [`COVER_EXTENSIONS`]
@@ -337,6 +345,7 @@ mod tests {
             grad: (0, 0, 0),
             cover_path: None,
             lyrics: None,
+            mtime: None,
         };
         let tracks = vec![
             mk(0, "周杰伦", "晴天"),
@@ -370,10 +379,64 @@ mod tests {
             grad: (0, 0, 0),
             cover_path: None,
             lyrics: None,
+            mtime: None,
         }];
         let g = build_mix_groups(&tracks);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].title, "未知歌手");
         assert_eq!(g[0].subtitle, "1首");
+    }
+
+    #[test]
+    fn scan_fills_mtime_matches_fs() {
+        let dir = tmp_scan_tree();
+        let tracks = scan_dir(&dir);
+        // 在清理前与文件系统对拍（清理后文件已删，metadata 取不到 None）。
+        for t in &tracks {
+            let fs_mtime = std::fs::metadata(&t.path).and_then(|m| m.modified()).ok();
+            assert!(
+                fs_mtime.is_some(),
+                "文件应存在且可读 mtime: {}",
+                t.path.display()
+            );
+            assert_eq!(
+                t.mtime, fs_mtime,
+                "曲目 {} 的 mtime 应与文件系统一致",
+                t.path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_tracks_by_mtime_desc_none_last() {
+        use std::time::{Duration, SystemTime};
+        let base = SystemTime::UNIX_EPOCH;
+        let mk = |tag: &str, m: Option<SystemTime>| Track {
+            path: PathBuf::from(tag),
+            title: tag.to_string(),
+            artist: String::new(),
+            album: String::new(),
+            duration: 0.0,
+            grad: (0, 0, 0),
+            cover_path: None,
+            lyrics: None,
+            mtime: m,
+        };
+        let mut tracks = vec![
+            mk("none-b", None),
+            mk("old", Some(base + Duration::from_secs(100))),
+            mk("mid", Some(base + Duration::from_secs(200))),
+            mk("none-a", None),
+            mk("new", Some(base + Duration::from_secs(300))),
+        ];
+        sort_tracks_by_mtime_desc(&mut tracks);
+        let keys: Vec<&str> = tracks.iter().map(|t| t.path.to_str().unwrap()).collect();
+        assert_eq!(
+            keys,
+            vec!["new", "mid", "old", "none-b", "none-a"],
+            "最新在前、None 殿后且保持原相对顺序（稳定）"
+        );
+        assert!(tracks[3].mtime.is_none() && tracks[4].mtime.is_none());
     }
 }

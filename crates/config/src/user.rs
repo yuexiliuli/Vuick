@@ -155,6 +155,8 @@ pub struct UserPrefs {
     pub music_dir: Option<String>,
     /// 音乐收藏（歌曲路径字符串，新→旧）。
     pub music_liked: Vec<String>,
+    /// 最近播放的歌曲路径（新→旧；与 [`UserPrefs::music_liked`] 同级无上限）。
+    pub music_recent: Vec<String>,
     /// 音乐播放器音量（0..=1）。`None` = 未设置过，用播放器默认 1.0。
     pub music_volume: Option<f32>,
     /// 上次播放/选中的曲目绝对路径（跨重启恢复选中定位；`None` = 从未播放过）。
@@ -195,6 +197,7 @@ impl Default for UserPrefs {
             recent_files: Vec::new(),
             music_dir: None,
             music_liked: Vec::new(),
+            music_recent: Vec::new(),
             music_volume: None,
             music_last_track: None,
             music_progress_secs: None,
@@ -438,6 +441,8 @@ impl UserPrefs {
         // 音乐收藏：播放器 liked_order 无上限（仅去重置顶、不挤旧收藏），解析**不截断**，
         // 与写回口径一致（否则运行中 shell persist 把截断快照写回盘 = 第 51+ 首永久丢失）。
         prefs.music_liked = Self::read_string_array(map, "music_liked", usize::MAX);
+        // 最近播放：播放器 recent 与 liked 同语义（无上限、仅去重置顶），同样不截断。
+        prefs.music_recent = Self::read_string_array(map, "music_recent", usize::MAX);
         prefs
     }
 
@@ -461,7 +466,7 @@ impl UserPrefs {
     /// 从 JSON 对象里读一个「字符串数组」字段（见 [`UserPrefs::from_json_value`]）。
     /// `cap` 为该字段的截断上限：
     /// - `recent_folders` / `recent_files`（「最近打开」语义）传 [`RECENT_MAX`]，防手改配置超长；
-    /// - `music_liked`（收藏列表，播放器 no-cap 语义）传 `usize::MAX`，解析不截断，全量 roundtrip。
+    /// - `music_liked` / `music_recent`（收藏 / 最近播放，播放器 no-cap 语义）传 `usize::MAX`，解析不截断，全量 roundtrip。
     fn read_string_array(map: &Map<String, Value>, key: &str, cap: usize) -> Vec<String> {
         let Some(Value::Array(arr)) = map.get(key) else {
             return Vec::new();
@@ -541,6 +546,7 @@ impl UserPrefs {
             "recent_files": self.recent_files,
             "music_dir": self.music_dir,
             "music_liked": self.music_liked,
+            "music_recent": self.music_recent,
             "music_volume": self.music_volume,
             "music_last_track": self.music_last_track,
             "music_progress_secs": self.music_progress_secs,
@@ -655,6 +661,7 @@ mod tests {
             recent_files: Vec::new(),
             music_dir: None,
             music_liked: Vec::new(),
+            music_recent: Vec::new(),
             music_volume: None,
             music_last_track: None,
             music_progress_secs: None,
@@ -1116,6 +1123,45 @@ mod tests {
         let back = UserPrefs::from_json_value(&mixed);
         assert_eq!(back.music_liked.len(), 60, "music_liked 不受 recent 上限影响");
         assert_eq!(back.recent_files.len(), RECENT_MAX, "recent_files 仍截断到 50");
+    }
+
+    /// 最近播放（`music_recent`）roundtrip，镜像收藏 `music_liked` 的 no-cap 语义：
+    /// - 缺省默认 → 空（to_json_value 序列化空数组、读回空）；
+    /// - 写入（新→旧序）→ 读回保序不丢失；
+    /// - >50 首→不截断（recent 与 liked 同级无上限，非 RECENT_MAX 语义）；
+    /// - 非数组 → 空（安全护栏）。
+    #[test]
+    fn music_recent_json_roundtrip() {
+        // 缺省默认：序列化为空数组、读回空。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["music_recent"], serde_json::json!([]));
+        assert!(UserPrefs::from_json_value(&v).music_recent.is_empty());
+
+        // 写入（新→旧序：p2 为最近）→ roundtrip 保序不丢失。
+        let recent = vec![
+            r"D:\music\b - new.wav".to_string(),
+            r"D:\music\a - old.mp3".to_string(),
+        ];
+        let p = UserPrefs { music_recent: recent.clone(), ..UserPrefs::default() };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(back.music_recent, recent, "music_recent 应保序 roundtrip");
+
+        // >50 首不截断（与 music_liked 同级 no-cap）。
+        let many: Vec<String> = (0..60)
+            .map(|i| format!("D:\\music\\rec-{i:02}.mp3"))
+            .collect();
+        let v = serde_json::json!({ "music_recent": many });
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.music_recent.len(), 60, "music_recent 超过 50 首必须全量保留");
+        assert_eq!(
+            back.music_recent[59].as_str(),
+            "D:\\music\\rec-59.mp3",
+            "第 60 首（下标 59）必须保留"
+        );
+
+        // 非数组 → 空（安全护栏）。
+        let v = serde_json::json!({ "music_recent": "not-an-array" });
+        assert!(UserPrefs::from_json_value(&v).music_recent.is_empty());
     }
 
     /// PDF 画布背景两字段 roundtrip：pdf_bg（default 缺省；预设/自定义 roundtrip 保留，

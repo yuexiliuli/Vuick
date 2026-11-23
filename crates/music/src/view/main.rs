@@ -3,7 +3,11 @@
 //! - Home：横滑「我的推荐」Mix 卡（渐变封面 + hover 播放浮层，点击播放组内第一首）
 //!   + 「热门歌曲」表格；
 //! - Library：按艺术家分组的歌曲列表（组头 + 行）；
-//! - Liked：只列已收藏歌曲。
+//! - Liked：只列已收藏歌曲；
+//! - Discover：艺术家网格 + 猜你喜欢（liked∪recent 艺术家）+ 最近添加（mtime 倒序）；
+//! - Radio：私人电台英雄卡（状态 + 开始/停止主钮 + 当前曲目）；
+//! - Downloads：本地下载（全库按搜索词过滤的歌曲表）；
+//! - Playlist(i)：歌单详情（渐变横幅 + `mix_groups[i]` 内曲目行）。
 //!
 //! 搜索框：ASCII 可打印键直接落文本（`key_char`），中文走 IME（view 的
 //! `EntityInputHandler`）：当前简化实现支持即输即滤。
@@ -31,7 +35,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::model::Track;
+use crate::model::{MixGroup, Track};
 
 use super::icon::{IconView, MusicIcon};
 use super::{MainSection, MusicView, theme};
@@ -65,6 +69,15 @@ pub(super) const HOT_TITLE_H: f32 = 90.0;
 /// Home 空态占位行高（px，虚拟行固定高）：空库/扫描中/搜索 0 命中时仍在列表内占位
 /// （稳定竖向布局，随整页可滚、不 panic）。
 pub(super) const HOME_EMPTY_H: f32 = 120.0;
+
+/// 歌单详情横幅高（px，虚拟行固定高）：渐变横幅（标题 + N首）。
+const BANNER_H: f32 = 120.0;
+
+/// 电台英雄卡高（px，虚拟行固定高）：渐变背景 + 「私人电台」+ 状态 + 开始/停止主钮。
+const RADIO_HERO_H: f32 = 200.0;
+
+/// 发现页艺术家网格列数（flex_1 等分卡；行高复用 [`REC_CARDS_H`]）。
+const ARTIST_COLS: usize = 3;
 
 /// 可视窗上下各多物化 N 行（缓冲）：快速滚动不至于露白/闪。
 const VISIBLE_BUFFER: usize = 6;
@@ -103,6 +116,37 @@ pub(super) enum MainItem {
     HomeHotTitle { total: usize },
     /// Home 空态占位行（固定高 [`HOME_EMPTY_H`]；空库/扫描中/搜索 0 命中时列表仍可滚）。
     HomeEmpty,
+    // ---- 歌单详情 / 发现 / 电台 固定高虚拟项（`build_main_list(Playlist/Discover/Radio)` 插）----
+    /// 歌单详情渐变横幅（固定高 [`BANNER_H`]；标题 + N首，渐变取 `mix_groups[i].grad`）。
+    PlaylistBanner { title: Arc<str>, count: usize },
+    /// 发现「艺术家」标题行（固定高 [`REC_TITLE_H`]）。
+    DiscoverArtistTitle,
+    /// 发现「艺术家」网格行（固定高 [`REC_CARDS_H`]；`first` = 组下标起点、`count` = 本行
+    /// 卡数 ≤ [`ARTIST_COLS`]，flex_1 等分、窗口变宽不溢出）。
+    DiscoverArtistRow { first: usize, count: usize },
+    /// 发现「猜你喜欢」标题行（固定高 [`REC_TITLE_H`]）。
+    DiscoverGuessTitle,
+    /// 发现「猜你喜欢」横滑行（固定高 [`REC_CARDS_H`]）。
+    DiscoverGuessRow,
+    /// 发现「最近添加」标题行（固定高 [`REC_TITLE_H`]）。
+    DiscoverRecentTitle,
+    /// 发现「最近添加」横滑行（固定高 [`REC_CARDS_H`]）。
+    DiscoverRecentRow,
+    /// 发现空态占位（固定高 [`HOME_EMPTY_H`]；无艺术家/无推荐/无最近三况之一）。
+    DiscoverEmpty(DiscoverEmptyKind),
+    /// 电台英雄卡（固定高 [`RADIO_HERO_H`]）。
+    RadioHero,
+}
+
+/// 发现页空态类别（占位文案区分）。
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DiscoverEmptyKind {
+    /// 无艺术家（库空/无分组）。
+    Artists,
+    /// 无推荐（猜你喜欢：无收藏/播放记录命中）。
+    Guess,
+    /// 无最近添加（按 mtime 空/全未知）。
+    Recent,
 }
 
 /// 主区「过滤+分组」后的扁平显示模型（一次构建、缓存复用）：
@@ -129,6 +173,15 @@ impl MainList {
                 MainItem::HomeMixRow => REC_CARDS_H as i32,
                 MainItem::HomeHotTitle { .. } => HOT_TITLE_H as i32,
                 MainItem::HomeEmpty => HOME_EMPTY_H as i32,
+                MainItem::PlaylistBanner { .. } => BANNER_H as i32,
+                MainItem::DiscoverArtistTitle
+                | MainItem::DiscoverGuessTitle
+                | MainItem::DiscoverRecentTitle => REC_TITLE_H as i32,
+                MainItem::DiscoverArtistRow { .. }
+                | MainItem::DiscoverGuessRow
+                | MainItem::DiscoverRecentRow => REC_CARDS_H as i32,
+                MainItem::DiscoverEmpty(_) => HOME_EMPTY_H as i32,
+                MainItem::RadioHero => RADIO_HERO_H as i32,
             };
             prefix.push(acc);
         }
@@ -228,6 +281,10 @@ impl super::MusicView {
             MainSection::Library => self.render_library(window, cx),
             MainSection::Liked => self.render_liked(window, cx),
             MainSection::Recent => self.render_recent(window, cx),
+            MainSection::Discover => self.render_discover(window, cx),
+            MainSection::Radio => self.render_radio(window, cx),
+            MainSection::Downloads => self.render_downloads(window, cx),
+            MainSection::Playlist(i) => self.render_playlist(window, cx, i),
         };
         div()
             .id("music-main")
@@ -266,7 +323,7 @@ impl super::MusicView {
                     .text_size(px(24.))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(theme::text())
-                    .child(format!("{greeting}，Koa")),
+                    .child(format!("{greeting}，{}", super::local_username())),
             )
             .child(
                 div().flex().items_center().gap_x(px(12.))
@@ -763,6 +820,432 @@ impl super::MusicView {
             .into_any_element()
     }
 
+    // ---- 发现：艺术家网格 + 猜你喜欢 + 最近添加（整页并入 `#music-list` 竖向虚拟滚动） ----
+
+    fn render_discover(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let list = self.main_list_for(MainSection::Discover, cx);
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(self.render_list(&list, cx))
+            .into_any_element()
+    }
+
+    // ---- 电台：英雄卡（虚拟列表内单个固定高项）----
+
+    fn render_radio(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let list = self.main_list_for(MainSection::Radio, cx);
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(self.render_list(&list, cx))
+            .into_any_element()
+    }
+
+    // ---- 本地下载：全库按搜索词过滤的歌曲表（不按收藏过滤）----
+
+    fn render_downloads(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let list = self.main_list_for(MainSection::Downloads, cx);
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(self.section_title("本地下载"))
+            .child(if list.total == 0 {
+                super::empty_state("暂无歌曲", "点开一个音乐文件夹加载曲库").into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(self.render_song_header())
+                    .child(self.render_list(&list, cx))
+                    .into_any_element()
+            })
+            .into_any_element()
+    }
+
+    // ---- 歌单详情：横幅（虚拟项顶部）+ 组内曲目行 ----
+
+    fn render_playlist(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+        gi: usize,
+    ) -> AnyElement {
+        let (title, has_tracks) = {
+            let p = self.player.read(cx);
+            match p.mix_groups().get(gi) {
+                Some(g) => (g.title.clone(), !g.tracks.is_empty()),
+                None => (String::new(), false),
+            }
+        };
+        let list = self.main_list_for(MainSection::Playlist(gi), cx);
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(self.section_title(if title.is_empty() { "歌单" } else { &title }))
+            .child(if !has_tracks {
+                super::empty_state("暂无歌曲", "该歌单没有歌曲").into_any_element()
+            } else {
+                self.render_list(&list, cx)
+            })
+            .into_any_element()
+    }
+
+    // ---- 歌单横幅 / 发现行 / 电台英雄卡 的各固定高虚拟项渲染 ----
+
+    /// 歌单详情渐变横幅（虚拟项固定高 [`BANNER_H`]）：渐变 `mix_groups[i].grad` 铺底 +
+    /// 标题 + 「N首」（组内总曲数，不随搜索收敛）。
+    fn render_playlist_banner(&mut self, title: &str, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let grad = self
+            .player
+            .read(cx)
+            .mix_groups()
+            .iter()
+            .find(|g| g.title == title)
+            .cloned()
+            .map(|g| g.grad)
+            .unwrap_or_else(|| ("#7c5cfc".into(), "#3d2f8a".into()));
+        let (light, dark) = (theme::from_hex_str(&grad.0), theme::from_hex_str(&grad.1));
+        div()
+            .id(format!("playlist-banner-{title}"))
+            .debug_selector(move || format!("playlist-banner-{title}"))
+            .h(px(BANNER_H))
+            .rounded(px(14.))
+            .relative()
+            .overflow_hidden()
+            .child(theme::gradient_cover((light, dark), 14.0))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .justify_center()
+                    .px(px(24.))
+                    .child(
+                        div()
+                            .text_size(px(24.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child(title.to_string()),
+                    )
+                    .child(
+                        div()
+                            .pt_1()
+                            .text_size(px(13.))
+                            .text_color(theme::text2())
+                            .child(format!("{count}首")),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 发现页行标题（固定高 [`REC_TITLE_H`]；「艺术家/猜你喜欢/最近添加」）。
+    fn discover_title(&mut self, text: &str) -> AnyElement {
+        div()
+            .h(px(REC_TITLE_H))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(18.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(theme::text())
+                    .child(text.to_string()),
+            )
+            .into_any_element()
+    }
+
+    /// 发现「艺术家」网格行（虚拟项固定高 [`REC_CARDS_H`]）：`count` 张 flex_1 等分卡
+    /// （渐变封面 + 艺术家名 + N首），窗口变宽自动均分、不溢出。
+    fn discover_artist_row(&mut self, first: usize, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let cards: Vec<(String, (String, String), usize)> = (0..count)
+            .filter_map(|k| {
+                let g = self.player.read(cx).mix_groups().get(first + k)?;
+                Some((g.title.clone(), g.grad.clone(), g.tracks.len()))
+            })
+            .collect();
+        div()
+            .id("discover-artist-row")
+            .debug_selector(|| "discover-artist-row".into())
+            .h(px(REC_CARDS_H))
+            .flex()
+            .gap_x(px(16.))
+            .pb(px(10.))
+            .children(cards.into_iter().map(|(title, grad, n)| {
+                let r = theme::from_hex_str(&grad.0);
+                let d = theme::from_hex_str(&grad.1);
+                let sel = title.clone();
+                div()
+                    .id(format!("discover-artist-{title}"))
+                    .debug_selector(move || format!("discover-artist-{sel}"))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .rounded(px(10.))
+                            .relative()
+                            .overflow_hidden()
+                            .child(theme::gradient_cover((r, d), 10.0))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::new(IconName::Note)
+                                            .size(px(26.))
+                                            .text_color(theme::white_fade_40()),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pt_1()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .text_ellipsis()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text3())
+                            .child(format!("{n}首")),
+                    )
+                    .into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    /// 发现「猜你喜欢」横滑行（虚拟项固定高 [`REC_CARDS_H`]）：推荐组（库路径 ∈ liked∪recent
+    /// 的艺术家中取前 6）复用 [`Self::mix_card`]，横向滚动位置独立持久化。
+    fn discover_guess_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let groups: Vec<(String, String, Vec<usize>, (String, String))> = {
+            let p = self.player.read(cx);
+            let gs = p.mix_groups();
+            guess_group_idxs(p.library(), Some(p.liked_paths()), Some(p.recent()), gs)
+                .into_iter()
+                .filter_map(|gi| gs.get(gi))
+                .map(|g| (g.title.clone(), g.subtitle.clone(), g.tracks.clone(), g.grad.clone()))
+                .collect()
+        };
+        let cards: Vec<AnyElement> = groups
+            .into_iter()
+            .map(|(t, s, tr, gr)| self.mix_card(t, s, tr, gr, cx))
+            .collect();
+        let stop = cx.listener(|_this: &mut MusicView, _ev, _w: &mut Window, cx| {
+            cx.stop_propagation();
+        });
+        div()
+            .id("discover-guess-row")
+            .debug_selector(|| "discover-guess-row".into())
+            .h(px(REC_CARDS_H))
+            .overflow_hidden()
+            .on_scroll_wheel(stop)
+            .child(
+                div()
+                    .id("discover-guess-scroll")
+                    .size_full()
+                    .flex()
+                    .gap_x(px(16.))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.main_guess_scroll)
+                    .pb(px(10.))
+                    .children(cards),
+            )
+            .into_any_element()
+    }
+
+    /// 发现「最近添加」横滑行（虚拟项固定高 [`REC_CARDS_H`]）：按 mtime 倒序取前 8 首，
+    /// 每首一张 mix 卡（标题 + 艺术家·时长 + 渐变/封面），横向滚动位置独立持久化。
+    fn discover_recent_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let data: Vec<(String, String, Vec<usize>, (String, String))> = {
+            let p = self.player.read(cx);
+            let lib = p.library();
+            recent_by_mtime_idxs(lib)
+                .into_iter()
+                .filter_map(|idx| {
+                    let t = lib.get(idx)?;
+                    Some((
+                        t.title.clone(),
+                        format!("{} · {}", t.artist, crate::model::duration_str(t.duration)),
+                        vec![idx],
+                        track_grad_hex(t.grad),
+                    ))
+                })
+                .collect()
+        };
+        let cards: Vec<AnyElement> = data
+            .into_iter()
+            .map(|(t, s, tr, gr)| self.mix_card(t, s, tr, gr, cx))
+            .collect();
+        let stop = cx.listener(|_this: &mut MusicView, _ev, _w: &mut Window, cx| {
+            cx.stop_propagation();
+        });
+        div()
+            .id("discover-recent-row")
+            .debug_selector(|| "discover-recent-row".into())
+            .h(px(REC_CARDS_H))
+            .overflow_hidden()
+            .on_scroll_wheel(stop)
+            .child(
+                div()
+                    .id("discover-recent-scroll")
+                    .size_full()
+                    .flex()
+                    .gap_x(px(16.))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.main_recent_scroll)
+                    .pb(px(10.))
+                    .children(cards),
+            )
+            .into_any_element()
+    }
+
+    /// 发现空态占位行（虚拟项固定高 [`HOME_EMPTY_H`]；无艺术家/无推荐/无最近 三况文案）。
+    fn discover_empty(&mut self, kind: DiscoverEmptyKind) -> AnyElement {
+        let (title, sub) = match kind {
+            DiscoverEmptyKind::Artists => ("暂无艺术家", "加载曲库后这里会出现艺术家"),
+            DiscoverEmptyKind::Guess => ("暂无推荐", "收藏或播放过的歌曲会出现在这里"),
+            DiscoverEmptyKind::Recent => ("暂无最近添加", "最近入库的歌曲会出现在这里"),
+        };
+        div()
+            .id("discover-empty")
+            .debug_selector(|| "discover-empty".into())
+            .h(px(HOME_EMPTY_H))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text2())
+                    .child(title.to_string()),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .text_size(px(12.))
+                    .text_color(theme::text3())
+                    .child(sub.to_string()),
+            )
+            .into_any_element()
+    }
+
+    /// 电台英雄卡（虚拟项固定高 [`RADIO_HERO_H`]）：渐变底 + 「私人电台」+ 状态
+    /// （已开播/未开播）+ 开始/停止主钮 + 当前曲目行。
+    fn render_radio_hero(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let (on, current_line) = {
+            let p = self.player.read(cx);
+            let line = p
+                .current_track()
+                .map(|t| format!("{} - {}", t.title, t.artist))
+                .unwrap_or_else(|| "未在播放".to_string());
+            (p.radio(), line)
+        };
+        let label = if on { "停止电台" } else { "开始电台" };
+        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
+            this.player.update(cx, |p, cx| {
+                if p.radio() {
+                    p.stop_radio();
+                } else {
+                    p.start_radio(cx);
+                }
+            });
+        });
+        div()
+            .id("radio-hero")
+            .debug_selector(|| "radio-hero".into())
+            .h(px(RADIO_HERO_H))
+            .rounded(px(16.))
+            .relative()
+            .overflow_hidden()
+            .child(theme::gradient_cover((theme::accent(), theme::pink()), 16.0))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(12.))
+                    .px(px(28.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_x(px(10.))
+                            .child(
+                                div()
+                                    .text_size(px(24.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(theme::text())
+                                    .child("私人电台"),
+                            )
+                            .child(
+                                div()
+                                    .px(px(10.))
+                                    .py(px(3.))
+                                    .rounded(px(10.))
+                                    .bg(theme::bg_hover())
+                                    .text_size(px(12.))
+                                    .text_color(if on { theme::green() } else { theme::text3() })
+                                    .child(if on { "已开播" } else { "未开播" }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("radio-toggle")
+                            .debug_selector(|| "radio-toggle".into())
+                            .px(px(20.))
+                            .h(px(38.))
+                            .rounded(px(19.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme::accent())
+                            .cursor(CursorStyle::PointingHand)
+                            .on_click(cl)
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme::text())
+                                    .child(label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme::text2())
+                            .child(current_line),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 分区标题（音乐库/收藏/最近播放）：固定于列表滚动区之上（同表头/搜索——只列表滚动）。
     fn section_title(&self, title: &str) -> AnyElement {
         div()
@@ -801,6 +1284,19 @@ impl super::MusicView {
                 MainItem::HomeMixRow => self.home_mix_row(cx),
                 MainItem::HomeHotTitle { total } => self.home_hot_title(*total),
                 MainItem::HomeEmpty => self.home_empty(cx),
+                MainItem::PlaylistBanner { title, count } => {
+                    self.render_playlist_banner(title, *count, cx)
+                }
+                MainItem::DiscoverArtistTitle => self.discover_title("艺术家"),
+                MainItem::DiscoverArtistRow { first, count } => {
+                    self.discover_artist_row(*first, *count, cx)
+                }
+                MainItem::DiscoverGuessTitle => self.discover_title("猜你喜欢"),
+                MainItem::DiscoverGuessRow => self.discover_guess_row(cx),
+                MainItem::DiscoverRecentTitle => self.discover_title("最近添加"),
+                MainItem::DiscoverRecentRow => self.discover_recent_row(cx),
+                MainItem::DiscoverEmpty(kind) => self.discover_empty(*kind),
+                MainItem::RadioHero => self.render_radio_hero(cx),
             }))
             .child(div().h(px(bottom_h)));
         let scrollbar = self.main_scrollbar(list, cx);
@@ -895,17 +1391,18 @@ impl super::MusicView {
             }
         let list = {
             let p = self.player.read(cx);
-            let liked = if section == MainSection::Liked {
+            let discover = section == MainSection::Discover;
+            let liked = if section == MainSection::Liked || discover {
                 Some(p.liked_paths())
             } else {
                 None
             };
-            let recent = if section == MainSection::Recent {
+            let recent = if section == MainSection::Recent || discover {
                 Some(p.recent())
             } else {
                 None
             };
-            build_main_list(section, p.library(), &key.1, liked, recent)
+            build_main_list(section, p.library(), &key.1, liked, recent, p.mix_groups())
         };
         self.main_list_cache
             .insert(key, (mutation, list.clone()));
@@ -1058,6 +1555,28 @@ impl super::MusicView {
                 .child(crate::model::duration_str(duration)),
         )
         .child(
+            // 行级「下一首播放（加入队列）」钮：加在当前行之后（不打断播放）；等宽小图标
+            // 列（参照心形钮 w40 / 17 图标），`stop_propagation` 防触发行播放。
+            div()
+                .id(format!("song-que-{idx}"))
+                .debug_selector(move || format!("song-que-{idx}"))
+                .w(px(40.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor(CursorStyle::PointingHand)
+                .text_color(theme::text3())
+                .on_click(cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
+                    this.add_to_queue_row(idx, cx);
+                    cx.stop_propagation();
+                }))
+                .child(
+                    Icon::new(IconName::PlaylistAdd)
+                        .size(px(17.))
+                        .text_color(theme::text3()),
+                ),
+        )
+        .child(
             div()
                 .id(format!("song-like-{idx}"))
                 .w(px(40.))
@@ -1089,15 +1608,59 @@ fn filter_pass(title: &str, artist: &str, q: &str) -> bool {
     title.to_lowercase().contains(&ql) || artist.to_lowercase().contains(&ql)
 }
 
+/// 发现「猜你喜欢」推荐组下标：取「库路径 ∈ liked ∪ recent」对应艺术家的 `mix_groups` 组
+/// （按组序），`take(6)`。纯函数——`build_main_list` 用它判「有无推荐」，渲染期
+/// `discover_guess_row` 用同函数重算卡片集，保证二者恒一致。
+fn guess_group_idxs(
+    lib: &[Track],
+    liked: Option<&std::collections::HashSet<String>>,
+    recent: Option<&[String]>,
+    groups: &[MixGroup],
+) -> Vec<usize> {
+    let mut want: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in lib {
+        let p = t.path.to_string_lossy().to_string();
+        if liked.is_some_and(|l| l.contains(&p)) || recent.is_some_and(|r| r.contains(&p)) {
+            want.insert(t.artist.clone());
+        }
+    }
+    groups
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| want.contains(&g.title))
+        .map(|(i, _)| i)
+        .take(6)
+        .collect()
+}
+
+/// 发现「最近添加」库下标：按 `mtime` 倒序（`None` 殿后、之间稳定序）取前 8。不克隆
+/// `Track`（只排下标）；等价 `library::sort_tracks_by_mtime_desc` 后再 take(8) 的语义。
+fn recent_by_mtime_idxs(lib: &[Track]) -> Vec<usize> {
+    let mut idxs: Vec<usize> = (0..lib.len()).collect();
+    idxs.sort_unstable_by(|&a, &b| lib[b].mtime.cmp(&lib[a].mtime));
+    idxs.truncate(8);
+    idxs
+}
+
+/// `Track.grad`（主色 `(r,g,b)`）→ `#rrggbb` 渐变双色（`(light, dark)`）：dark 按
+/// `theme::gradient_pair_of` 同款 0.55 系数加深，保证封面观感同源。
+fn track_grad_hex((r, g, b): (u32, u32, u32)) -> (String, String) {
+    let light = format!("#{:06x}", (r << 16) | (g << 8) | b);
+    let dark = format!("#{:06x}", ((r * 55 / 100) << 16) | ((g * 55 / 100) << 8) | (b * 55 / 100));
+    (light, dark)
+}
+
 /// 构建主区某分区的过滤/分组显示模型（纯索引，零 `Track` 克隆；`main_list_for` 在
 /// 搜索词 × 库/收藏/历史变更（mutation）加速键变化时调用）。Liked 需 `liked`（已收藏
-/// 路径集）、Recent 需 `recent`（会话播放历史序，最近先）过滤。
+/// 路径集）、Recent 需 `recent`（会话播放历史序，最近先）过滤；Discover 需两者（猜你喜欢
+/// 推荐 = liked∪recent 艺术家）；Playlist(i)/Discover/Radio 需 `mix_groups`（歌单/艺术家）。
 fn build_main_list(
     section: MainSection,
     lib: &[Track],
     q: &str,
     liked: Option<&std::collections::HashSet<String>>,
     recent: Option<&[String]>,
+    groups: &[MixGroup],
 ) -> Rc<MainList> {
     match section {
         MainSection::Library => {
@@ -1165,6 +1728,75 @@ fn build_main_list(
                 let t = &lib[i];
                 if filter_pass(&t.title, &t.artist, q) {
                     items.push(MainItem::Row { idx: i, rank });
+                    rank += 1;
+                }
+            }
+            Rc::new(MainList::new(items, rank))
+        }
+        MainSection::Discover => {
+            // 发现：三个固定高头部/内容组（艺术家网格 + 猜你喜欢 + 最近添加）全随整页虚拟滚动。
+            // 艺术家网格：每组一行、flex_1 等分卡；空库 → 单空态占位终止（不再铺猜/最近空槽）。
+            let mut items = Vec::new();
+            items.push(MainItem::DiscoverArtistTitle);
+            if groups.is_empty() {
+                items.push(MainItem::DiscoverEmpty(DiscoverEmptyKind::Artists));
+                return Rc::new(MainList::new(items, 0));
+            }
+            let rows = (groups.len() + ARTIST_COLS - 1) / ARTIST_COLS;
+            for r in 0..rows {
+                let first = r * ARTIST_COLS;
+                let count = ARTIST_COLS.min(groups.len() - first);
+                items.push(MainItem::DiscoverArtistRow { first, count });
+            }
+            // 猜你喜欢：liked∪recent 艺术家组非空 → 横滑行，否则空态占位。
+            items.push(MainItem::DiscoverGuessTitle);
+            if guess_group_idxs(lib, liked, recent, groups).is_empty() {
+                items.push(MainItem::DiscoverEmpty(DiscoverEmptyKind::Guess));
+            } else {
+                items.push(MainItem::DiscoverGuessRow);
+            }
+            // 最近添加：按 mtime 倒序取前 8 首；空 → 空态占位。
+            items.push(MainItem::DiscoverRecentTitle);
+            if recent_by_mtime_idxs(lib).is_empty() {
+                items.push(MainItem::DiscoverEmpty(DiscoverEmptyKind::Recent));
+            } else {
+                items.push(MainItem::DiscoverRecentRow);
+            }
+            Rc::new(MainList::new(items, 0))
+        }
+        MainSection::Radio => {
+            // 电台：单个固定高英雄卡（渐变底 + 状态 + 开始/停止钮 + 当前曲目），不参与搜索。
+            Rc::new(MainList::new(vec![MainItem::RadioHero], 0))
+        }
+        MainSection::Downloads => {
+            // 本地下载：镜像 Liked 但**不带** like 过滤 = 全库按搜索词过滤的纯歌行。
+            let mut items = Vec::new();
+            let mut rank = 0usize;
+            for (i, t) in lib.iter().enumerate() {
+                if filter_pass(&t.title, &t.artist, q) {
+                    items.push(MainItem::Row { idx: i, rank });
+                    rank += 1;
+                }
+            }
+            Rc::new(MainList::new(items, rank))
+        }
+        MainSection::Playlist(gi) => {
+            // 歌单详情：顶部渐变横幅 + `groups[gi].tracks` 各 Track 行（`idx` = 库下标直传
+            // `song_row` 点击语义）；行内搜索过滤同 Library（artist/title）。组缺失/越界 →
+            // 空列表（`render_playlist` 空态接管）。
+            let Some(g) = groups.get(gi) else {
+                return Rc::new(MainList::new(Vec::new(), 0));
+            };
+            let mut items = Vec::with_capacity(g.tracks.len() + 1);
+            items.push(MainItem::PlaylistBanner {
+                title: g.title.clone().into(),
+                count: g.tracks.len(),
+            });
+            let mut rank = 0usize;
+            for &idx in &g.tracks {
+                let t = &lib[idx];
+                if filter_pass(&t.title, &t.artist, q) {
+                    items.push(MainItem::Row { idx, rank });
                     rank += 1;
                 }
             }

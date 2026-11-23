@@ -80,6 +80,22 @@ impl IntoIconElement for ui::icon::IconName {
     }
 }
 
+/// 本机用户名（Windows `USERNAME` / *nix `USER` 环境变量；取不到回退「用户」）。
+/// 侧栏用户卡 / 首页问候共用（不再写死「Koa」）。
+pub(super) fn local_username() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "用户".into())
+}
+
+/// 用户名首字符（大写；空回退「U」）：用户卡头像字母。
+pub(super) fn username_initial(name: &str) -> String {
+    name.chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "U".into())
+}
+
 /// 侧栏主导航分区。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum MainSection {
@@ -92,6 +108,14 @@ pub enum MainSection {
     Liked,
     /// 最近播放（本次会话播放历史，最近先；切库/重开音乐模式清空）。
     Recent,
+    /// 发现（艺术家网格 + 猜你喜欢 + 最近添加）。
+    Discover,
+    /// 私人电台（英雄卡 + 状态 + 开始/停止主钮）。
+    Radio,
+    /// 本地下载（全库按搜索词过滤的歌曲表）。
+    Downloads,
+    /// 歌单详情（`usize` = `mix_groups()` 下标）。
+    Playlist(usize),
 }
 
 /// 右侧「正在播放」面板 tab。
@@ -107,7 +131,7 @@ pub enum RightTab {
 /// 视图本地状态（播放器状态在 [`MusicPlayer`] 里读）。
 #[derive(Default)]
 pub struct ViewState {
-    /// 主导航分区（首页/音乐库/收藏/最近播放）。
+    /// 主导航分区（首页/音乐库/收藏/最近播放/发现/电台/本地下载/歌单详情）。
     pub section: MainSection,
     /// 右侧面板 tab（歌曲/歌词/队列）。
     pub right_tab: RightTab,
@@ -231,6 +255,11 @@ pub struct MusicView {
     /// **持久化横滚位置**——HomeMixRow 虚拟行滚出再滚回不丢；竖向滚轮经 `overflow_x_scroll`
     /// 原生转横向写回此句柄，行壳 `stop_propagation` 阻止整页竖向滚（见 `main::home_mix_row`）。
     main_mix_scroll: ScrollHandle,
+    /// 发现页「猜你喜欢」横滑滚动句柄：`track_scroll` 绑定行内 `#discover-guess-scroll`，
+    /// 持久化横滚位置（虚拟行滚出再滚回不丢；与最近添加行各自独立，互不串位）。
+    main_guess_scroll: ScrollHandle,
+    /// 发现页「最近添加」横滑滚动句柄：`track_scroll` 绑定行内 `#discover-recent-scroll`。
+    main_recent_scroll: ScrollHandle,
     /// 主区「过滤/分组显示模型」缓存（`(分区, 搜索词)` → `(库变更计数, Rc<显示模型>)`）：
     /// 同一搜索词且 `player.mutation()` 不变则复用——消除每帧重过滤 + `Vec<Track>` 深克隆。
     main_list_cache: HashMap<(MainSection, String), (u64, Rc<main::MainList>)>,
@@ -315,6 +344,8 @@ impl MusicView {
             cover_loading: HashSet::new(),
             main_scroll: ScrollHandle::new(),
             main_mix_scroll: ScrollHandle::new(),
+            main_guess_scroll: ScrollHandle::new(),
+            main_recent_scroll: ScrollHandle::new(),
             main_list_cache: HashMap::new(),
             main_sb_shown: Rc::new(Cell::new(false)),
             eq_main: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "row-current")),
@@ -886,6 +917,68 @@ impl MusicView {
         }
     }
 
+    /// 分享当前播放曲目：把「{title} - {artist}」写系统剪贴板 + toast 反馈。
+    /// 剪贴板走 `App::write_to_clipboard`（`Context` 直接解引用到 `App` 即得，无需 window；
+    /// 参照 editor `Context::copy` 同款姿势）；无当前曲 → 只提示、不写剪贴板。
+    pub(super) fn share_current(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .player
+            .read(cx)
+            .current_track()
+            .map(|t| format!("{} - {}", t.title, t.artist));
+        match text {
+            Some(t) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(t.clone()));
+                self.toast_msg(format!("已复制：{t}"), cx);
+            }
+            None => self.toast_msg("暂无正在播放的歌曲", cx),
+        }
+    }
+
+    /// 加入队列（作用于当前播放曲）：全库即队列 + 去重，`play_track` 已把当前曲入队，
+    /// `add_to_queue_next` 对 `idx == current` 是内在 no-op（去重下无「再插自身」语义）——
+    /// 因此只诚实地提示「已在队列」，不再谎报「已加入下一首」；真实加入下一首由行级
+    /// [`Self::add_to_queue_row`]（任意行入口）承担。
+    pub(super) fn add_to_queue_current(&mut self, cx: &mut Context<Self>) {
+        match self.player.read(cx).current() {
+            Some(_) => self.toast_msg("当前歌曲已在播放队列中", cx),
+            None => self.toast_msg("暂无正在播放的歌曲", cx),
+        }
+    }
+
+    /// 加入队列（作用于**任意指定曲**，行级「下一首播放」入口）：`idx` 越界 → 空操作；
+    /// 否则 `add_to_queue_next`（非当前曲 = 去重插到 `current` 之后 / 队首，当前曲 = no-op）。
+    pub(super) fn add_to_queue_row(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.player.read(cx).library().len() {
+            return;
+        }
+        self.player.update(cx, |p, cx| p.add_to_queue_next(idx, cx));
+        self.toast_msg("已加入队列（下一首播放）", cx);
+    }
+
+    /// 在系统文件管理器中定位当前播放曲目文件（打开所在文件夹）。
+    /// `explorer`/`open` 启动为 ~ms 级、`Command::spawn` 非阻塞（参照 shell
+    /// `file_tree_ops` 先例，不做后台线程）；目标文件已不存在（被删/换库残留）或启动
+    /// 失败 → toast 提示、绝不 panic，也不开 Explorer 空窗。
+    pub(super) fn reveal_current(&mut self, cx: &mut Context<Self>) {
+        let path = self.player.read(cx).current_track().map(|t| t.path.clone());
+        match path {
+            Some(p) => {
+                // 先验存在再 spawn：对不存在路径直接走错误提示（确定性、无侧效），
+                // 与 tester 判别式「注入不存在路径 → 仅 toast、不 panic」对齐。
+                if !p.exists() {
+                    self.toast_msg("无法在资源管理器中显示：文件不存在", cx);
+                    return;
+                }
+                match reveal_in_folder(&p) {
+                    Ok(()) => self.toast_msg("已在资源管理器中显示", cx),
+                    Err(e) => self.toast_msg(format!("无法在资源管理器中显示：{e}"), cx),
+                }
+            }
+            None => self.toast_msg("暂无正在播放的歌曲", cx),
+        }
+    }
+
     pub fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
         let next = match self.player.read(cx).repeat() {
             RepeatMode::Off => RepeatMode::All,
@@ -928,8 +1021,17 @@ impl MusicView {
         }
     }
 
+    /// 切换主导航分区：电台漏斗——离开 `Radio` → `player.stop_radio()`；进入 `Radio` 且
+    /// 未开播 → `player.start_radio(cx)`（先读旧分区再切换，防借用顺序冲突）。
     fn set_section(&mut self, section: MainSection, cx: &mut Context<Self>) {
+        let leaving_radio = self.state.section == MainSection::Radio && section != MainSection::Radio;
+        if leaving_radio {
+            self.player.update(cx, |p, _| p.stop_radio());
+        }
         self.state.section = section;
+        if section == MainSection::Radio && !self.player.read(cx).radio() {
+            self.player.update(cx, |p, cx| p.start_radio(cx));
+        }
         cx.notify();
     }
 
@@ -1148,6 +1250,31 @@ pub fn filter_tracks_by_query(tracks: &[Track], q: &str) -> Vec<usize> {
         })
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Windows 在资源管理器中定位文件（不复刻 tray 依赖；同 `tray::reveal_in_explorer_command`
+/// 同款姿势：只构造并 spawn 命令，失败由调用方 toast 兜底）。平台定制：
+/// - Windows：`explorer /select,<绝对路径>`（选中该文件/目录的资源管理器窗口）；
+/// - macOS：`open -R <绝对路径>`（Finder 中选中该文件/目录）；
+/// - 其它平台：`xdg-open <所在父目录>`（打开所在目录；缺 `xdg-open` 时 spawn 失败由
+///   调用方提示，符合既有容错面）。
+fn reveal_in_folder(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.to_string_lossy()))
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg("-R").arg(path).spawn().map(|_| ())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let dir = path.parent().unwrap_or(path);
+        std::process::Command::new("xdg-open").arg(dir).spawn().map(|_| ())
+    }
 }
 
 /// 列表空态：标题 + 副文案居中（主区 Library/Liked 空库提示）。

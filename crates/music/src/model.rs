@@ -19,6 +19,8 @@ pub struct Track {
     pub cover_path: Option<std::path::PathBuf>,
     /// 歌词（同名 `.lrc` 侧车解析；无则 None）。
     pub lyrics: Option<Lyrics>,
+    /// 文件修改时间（`std::fs::metadata::modified`；None=未知/读取失败）。
+    pub mtime: Option<std::time::SystemTime>,
 }
 
 /// 一句带时间戳的歌词。
