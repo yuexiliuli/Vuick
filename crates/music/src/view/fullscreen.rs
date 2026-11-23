@@ -23,6 +23,7 @@ use gpui::{
 
 use crate::model::{RepeatMode, duration_str};
 
+use super::buttons::icon_btn;
 use super::icon::{IconView, MusicIcon};
 use super::{IntoIconElement, MusicView, theme};
 use ui::icon::{Icon, IconName};
@@ -38,7 +39,7 @@ impl super::MusicView {
     /// 全屏浮层整块（v2：左列封面+控制 / 右列歌词）。
     pub(super) fn render_fullscreen(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = self.player.read(cx);
@@ -68,8 +69,8 @@ impl super::MusicView {
             .flex_col()
             .bg(theme::bg_deep())
             .child(self.render_fs_bg())
-            .child(self.render_fs_topbar(cx))
-            .child(self.render_fs_body(cx, title, artist, album, light, dark))
+            .child(self.render_fs_topbar(window, cx))
+            .child(self.render_fs_body(window, cx, title, artist, album, light, dark))
             .child(self.render_fs_bottom_eq(playing))
             .into_any_element()
     }
@@ -104,7 +105,7 @@ impl super::MusicView {
     }
 
     /// 顶部工具条（v2）：左 playlist_add/share，中 "NOW PLAYING"，右 high_quality/close。
-    fn render_fs_topbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_fs_topbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         div()
             .absolute()
             .top_0()
@@ -120,8 +121,8 @@ impl super::MusicView {
                     .flex()
                     .items_center()
                     .gap_x(px(12.))
-                    .child(self.fs_icon_btn(IconName::PlaylistAdd, "已添加到播放列表", cx))
-                    .child(self.fs_icon_btn(IconName::Share, "分享", cx)),
+                    .child(self.fs_icon_btn(window, IconName::PlaylistAdd, "已添加到播放列表", cx))
+                    .child(self.fs_icon_btn(window, IconName::Share, "分享", cx)),
             )
             .child(
                 div()
@@ -135,51 +136,54 @@ impl super::MusicView {
                     .flex()
                     .items_center()
                     .gap_x(px(12.))
-                    .child(self.fs_icon_btn(IconName::Badge, "高音质", cx))
+                    .child(self.fs_icon_btn(window, IconName::Badge, "高音质", cx))
                     .child(self.fs_close_btn(cx)),
             )
             .into_any_element()
     }
 
-    /// 工具条圆钮（40px，v2 悬停变亮）。
+    /// 工具条圆钮（40px）：统一 [`icon_btn`]——高亮由白淡显改 `bg_hover` 圆底（rest 透明，
+    /// 边框随迁去除）；tip 经 `hover_tip_listener` 注入（写入 tip + 锚定盒，不再写 `fs_hover`）。
+    /// `.id` 保持既有 `fs-btn-{tip}`（静态串映射，测试/debug 口径不变）。
     fn fs_icon_btn(
         &mut self,
+        window: &mut Window,
         icon: IconName,
         tip: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let hovered = self.fs_hover == Some(tip);
-        let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| match tip {
+        let id: &'static str = match tip {
+            "已添加到播放列表" => "fs-btn-已添加到播放列表",
+            "分享" => "fs-btn-分享",
+            "高音质" => "fs-btn-高音质",
+            _ => "fs-btn-未知",
+        };
+        let cl = cx.listener(move |this: &mut MusicView, _ev, w, cx| match tip {
             // 顶栏分享钮真实化：真正写剪贴板 + toast（不再只弹假提示）。
-            "分享" => this.share_current(_w, cx),
+            "分享" => this.share_current(w, cx),
             _ => this.toast_msg(tip, cx),
         });
-        div()
-            .id(format!("fs-btn-{tip}"))
-            .relative()
-            .w(px(theme::FS_CTRL_BTN_SIZE))
-            .h(px(theme::FS_CTRL_BTN_SIZE))
-            .rounded(px(theme::FS_CTRL_BTN_RADIUS))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(if hovered { theme::white_fade_12() } else { theme::white_fade_06() })
-            .border_1()
-            .border_color(theme::white_fade_08())
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cl)
-            .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
-                // 复用现有 toast 文案作悬停提示（id 与 tip 同名：fs-btn-{tip}）；
-                // 盒按 id（=tip）记入 tip_boxes，供 set_fs_hover_and_tip 锚定按钮盒。
-                this.set_fs_hover_and_tip(tip, Some(tip), *hovered, cx);
-            }))
-            .child(theme::bounds_canvas(self.tip_box_cell(tip)))
-            .child(
-                Icon::new(icon)
-                    .size(px(theme::FS_CTRL_BTN_ICON))
-                    .text_color(if hovered { theme::text() } else { theme::text2() }),
-            )
-            .into_any_element()
+        let cell = self.tip_box_cell(id);
+        let tip_writer = self.hover_tip_listener(cx, id, tip);
+        icon_btn(
+            window,
+            cx,
+            id,
+            format!("{id}-hover"),
+            icon,
+            theme::FS_CTRL_BTN_ICON,
+            theme::FS_CTRL_BTN_SIZE,
+            theme::FS_CTRL_BTN_RADIUS,
+            None,
+            false,
+            theme::text2(),
+            theme::text(),
+            None,
+            None,
+            cell,
+            tip_writer,
+            cl,
+        )
     }
 
     /// 关闭全屏钮（红 hover 语义：直接关 fs）。
@@ -230,6 +234,7 @@ impl super::MusicView {
     /// 主体两栏（v2 `.fs-body`：左列封面+控制，右列歌词）。
     fn render_fs_body(
         &mut self,
+        window: &mut Window,
         cx: &mut Context<Self>,
         title: String,
         artist: String,
@@ -247,7 +252,7 @@ impl super::MusicView {
             .gap_x(px(80.))
             .px(px(56.))
             .py(px(48.))
-            .child(self.render_fs_left(cx, title, artist, album, light, dark))
+            .child(self.render_fs_left(window, cx, title, artist, album, light, dark))
             .child(self.render_fs_lyrics(cx))
             .into_any_element()
     }
@@ -255,6 +260,7 @@ impl super::MusicView {
     /// 左列：封面 → 歌曲信息 → 进度 → 控制 → 音量+操作。
     fn render_fs_left(
         &mut self,
+        window: &mut Window,
         cx: &mut Context<Self>,
         title: String,
         artist: String,
@@ -271,8 +277,8 @@ impl super::MusicView {
             .child(self.render_fs_cover(cx, (light, dark)))
             .child(self.render_fs_song_meta(title, artist, album))
             .child(self.render_fs_progress(cx))
-            .child(self.render_fs_controls(cx))
-            .child(self.render_fs_bottom_row(cx))
+            .child(self.render_fs_controls(window, cx))
+            .child(self.render_fs_bottom_row(window, cx))
             .into_any_element()
     }
 
@@ -513,7 +519,7 @@ impl super::MusicView {
     }
 
     /// 控制行（v2 `.fs-controls`）：shuffle / prev / play(56 渐变圆) / next / repeat。
-    fn render_fs_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_fs_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let shuffle = p.shuffle();
         let repeat = p.repeat();
@@ -524,138 +530,139 @@ impl super::MusicView {
             .justify_center()
             .gap_x(px(24.))
             .mb(px(16.))
-            .child(self.fs_ctrl(IconName::Shuffle, 26., shuffle, "fs-shuffle", cx))
-            .child(self.fs_ctrl(MusicIcon::Prev, 26., false, "fs-prev", cx))
-            .child(self.fs_play_btn(cx))
-            .child(self.fs_ctrl(MusicIcon::Next, 26., false, "fs-next", cx))
-            .child(self.fs_repeat(repeat, cx))
+            .child(self.fs_ctrl(window, IconName::Shuffle, 26., shuffle, "fs-shuffle", cx))
+            .child(self.fs_ctrl(window, MusicIcon::Prev, 26., false, "fs-prev", cx))
+            .child(self.fs_play_btn(window, cx))
+            .child(self.fs_ctrl(window, MusicIcon::Next, 26., false, "fs-next", cx))
+            .child(self.fs_repeat(window, repeat, cx))
             .into_any_element()
     }
 
-    /// 普通控制钮（shuffle/prev/next）：active 变 accent，悬停变亮。
+    /// 普通控制钮（shuffle/prev/next）：统一 [`icon_btn`]——active 变 accent、新增 hover
+    /// 圆底（原仅图标变亮）；tip 经 `hover_tip_listener` 注入（不再写 `fs_hover`）。
     fn fs_ctrl<I: IntoIconElement>(
         &mut self,
+        window: &mut Window,
         icon: I,
         size: f32,
         active: bool,
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let hovered = self.fs_hover == Some(id);
+        let tip: &'static str = match id {
+            "fs-shuffle" => "随机播放",
+            "fs-prev" => "上一首",
+            "fs-next" => "下一首",
+            _ => "未知",
+        };
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| match id {
             "fs-shuffle" => this.toggle_shuffle(cx),
             "fs-prev" => this.player.update(cx, |p, cx| p.prev(cx)),
             "fs-next" => this.player.update(cx, |p, cx| p.next(cx)),
             _ => {}
         });
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .relative()
-            .w(px(size))
-            .h(px(size))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cl)
-            .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
-                let name: Option<&'static str> = match id {
-                    "fs-shuffle" => Some("随机播放"),
-                    "fs-prev" => Some("上一首"),
-                    "fs-next" => Some("下一首"),
-                    _ => None,
-                };
-                this.set_fs_hover_and_tip(id, name, *hovered, cx);
-            }))
-            .child(theme::bounds_canvas(self.tip_box_cell(id)))
-            .child(
-                icon.icon_element(
-                    px(size),
-                    if active {
-                        theme::accent()
-                    } else if hovered {
-                        theme::text()
-                    } else {
-                        theme::text2()
-                    },
-                ),
-            )
-            .into_any_element()
+        let cell = self.tip_box_cell(id);
+        let tip_writer = self.hover_tip_listener(cx, id, tip);
+        icon_btn(
+            window,
+            cx,
+            id,
+            format!("{id}-hover"),
+            icon,
+            size,
+            size,
+            size / 2.0,
+            None,
+            active,
+            theme::text2(),
+            theme::text(),
+            Some(theme::accent()),
+            None,
+            cell,
+            tip_writer,
+            cl,
+        )
     }
 
-    /// 主播放钮（56px accent→light 渐变圆，白图标）。
-    fn fs_play_btn(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// 主播放钮（56px accent→light 渐变圆，白图标）：统一 [`icon_btn`]，fill_bg 注入渐变圆底、
+    /// hover 叠白淡显；`fs-play` 既有阴影保留（英雄钮辉光，上包容器，不动圆角内部布局）。
+    fn fs_play_btn(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let playing = p.playing();
         let icon = if playing { MusicIcon::Pause } else { MusicIcon::Play };
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| this.toggle_play(cx));
+        let cell = self.tip_box_cell("fs-play");
+        let tip_writer = self.hover_tip_listener(cx, "fs-play", "播放/暂停");
+        let fill = theme::gradient_cover((theme::accent(), theme::accent_light()), 28.0);
+        let btn = icon_btn(
+            window,
+            cx,
+            "fs-play",
+            "fs-play-hover".to_string(),
+            icon,
+            28.,
+            56.,
+            28.,
+            None,
+            false,
+            theme::text(),
+            theme::text(),
+            None,
+            Some(fill),
+            cell,
+            tip_writer,
+            cl,
+        );
+        // 保留既有阴影（fs-play 英雄钮辉光；shadow 上包容器不动 icon_btn 圆角内部）。
         div()
-            .id("fs-play")
             .w(px(56.))
             .h(px(56.))
             .rounded(px(28.))
-            .relative()
             .overflow_hidden()
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
             .shadow(vec![gpui::BoxShadow::new(
                 px(0.),
                 px(4.),
                 theme::accent().opacity(0.5),
             )
             .blur_radius(px(24.))])
-            .on_click(cl)
-            .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
-                this.set_fs_hover_and_tip("fs-play", Some("播放/暂停"), *hovered, cx);
-            }))
-            .child(theme::bounds_canvas(self.tip_box_cell("fs-play")))
-            .child(theme::gradient_cover((theme::accent(), theme::accent_light()), 28.0))
-            .child(
-                IconView::new(icon)
-                    .size(px(28.))
-                    .text_color(theme::text()),
-            )
+            .child(btn)
             .into_any_element()
     }
 
-    /// 循环钮：非 Off 高亮 accent。
-    fn fs_repeat(&mut self, repeat: RepeatMode, cx: &mut Context<Self>) -> AnyElement {
+    /// 循环钮：非 Off 高亮 accent；统一 [`icon_btn`]（新增 hover 圆底）。
+    fn fs_repeat(
+        &mut self,
+        window: &mut Window,
+        repeat: RepeatMode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let active = repeat != RepeatMode::Off;
-        let hovered = self.fs_hover == Some("fs-repeat");
         let cl = cx.listener(|this: &mut MusicView, _ev, _w, cx| this.cycle_repeat(cx));
-        div()
-            .id("fs-repeat")
-            .relative()
-            .w(px(26.))
-            .h(px(26.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cl)
-            .on_hover(cx.listener(|this: &mut MusicView, hovered, _w, cx| {
-                this.set_fs_hover_and_tip("fs-repeat", Some("循环播放"), *hovered, cx);
-            }))
-            .child(theme::bounds_canvas(self.tip_box_cell("fs-repeat")))
-            .child(
-                Icon::new(IconName::Repeat)
-                    .size(px(24.))
-                    .text_color(if active {
-                        theme::accent()
-                    } else if hovered {
-                        theme::text()
-                    } else {
-                        theme::text2()
-                    }),
-            )
-            .into_any_element()
+        let cell = self.tip_box_cell("fs-repeat");
+        let tip_writer = self.hover_tip_listener(cx, "fs-repeat", "循环播放");
+        icon_btn(
+            window,
+            cx,
+            "fs-repeat",
+            "fs-repeat-hover".to_string(),
+            IconName::Repeat,
+            24.,
+            26.,
+            13.,
+            None,
+            active,
+            theme::text2(),
+            theme::text(),
+            Some(theme::accent()),
+            None,
+            cell,
+            tip_writer,
+            cl,
+        )
     }
 
     /// 底部行（v2 `.fs-bottom-row`）：音量条（120）+ 操作（收藏/队列/下载）。
-    fn render_fs_bottom_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_fs_bottom_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let volume = p.volume();
         let cur_liked = p.current().map(|i| p.is_liked(i)).unwrap_or(false);
@@ -672,6 +679,7 @@ impl super::MusicView {
                     .gap_x(px(12.))
                     .child(
                         self.fs_action(
+                            window,
                             if cur_liked {
                                 IconName::Heart
                             } else {
@@ -682,8 +690,8 @@ impl super::MusicView {
                             cx,
                         ),
                     )
-                    .child(self.fs_action(IconName::QueueMusic, false, "fs-que", cx))
-                    .child(self.fs_action(IconName::Download, false, "fs-dl", cx)),
+                    .child(self.fs_action(window, IconName::QueueMusic, false, "fs-que", cx))
+                    .child(self.fs_action(window, IconName::Download, false, "fs-dl", cx)),
             )
             .into_any_element()
     }
@@ -748,15 +756,16 @@ impl super::MusicView {
             .into_any_element()
     }
 
-    /// 操作小钮（收藏/队列/下载）：liked 用 pink，否则 text3（悬停变亮）。
+    /// 操作小钮（收藏/队列/下载）：liked 用 pink（hover 不覆盖），否则 text3（悬停变亮）；
+    /// 统一 [`icon_btn`]（新增 hover 圆底）；tip 经 `hover_tip_listener` 注入。
     fn fs_action(
         &mut self,
+        window: &mut Window,
         icon: IconName,
         liked: bool,
         id: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let hovered = self.fs_hover == Some(id);
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| match id {
             "fs-like" => {
                 if let Some(i) = this.player.read(cx).current() {
@@ -775,39 +784,33 @@ impl super::MusicView {
             "fs-dl" => this.reveal_current(cx),
             _ => {}
         });
-        div()
-            .id(id)
-            .relative()
-            .debug_selector(move || id.into())
-            .w(px(20.))
-            .h(px(20.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cl)
-            .on_hover(cx.listener(move |this: &mut MusicView, hovered, _w, cx| {
-                let name: Option<&'static str> = match id {
-                    "fs-like" => Some("收藏"),
-                    "fs-que" => Some("加入队列"),
-                    "fs-dl" => Some("下载"),
-                    _ => None,
-                };
-                this.set_fs_hover_and_tip(id, name, *hovered, cx);
-            }))
-            .child(theme::bounds_canvas(self.tip_box_cell(id)))
-            .child(
-                Icon::new(icon)
-                    .size(px(18.))
-                    .text_color(if liked {
-                        theme::pink()
-                    } else if hovered {
-                        theme::text()
-                    } else {
-                        theme::text3()
-                    }),
-            )
-            .into_any_element()
+        let tip: &'static str = match id {
+            "fs-like" => "收藏",
+            "fs-que" => "加入队列",
+            "fs-dl" => "下载",
+            _ => "未知",
+        };
+        let cell = self.tip_box_cell(id);
+        let tip_writer = self.hover_tip_listener(cx, id, tip);
+        icon_btn(
+            window,
+            cx,
+            id,
+            format!("{id}-hover"),
+            icon,
+            18.,
+            20.,
+            10.,
+            None,
+            liked,
+            theme::text3(),
+            theme::text(),
+            Some(theme::pink()),
+            None,
+            cell,
+            tip_writer,
+            cl,
+        )
     }
 
     /// 右列：歌词面板（v2 `.fs-right`：LYRICS 标题 + 同步歌词；无 LRC → 操作提示）。

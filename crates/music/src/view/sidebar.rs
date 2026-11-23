@@ -5,12 +5,63 @@
 //! 竖条）；歌单条目点击打开对应歌单详情（[`MainSection::Playlist`]）；条目色点 = 组渐变首色。
 
 use gpui::{
-    AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, App, Context, CursorStyle, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
 use super::{MainSection, MusicView, theme};
 use ui::icon::{Icon, IconName};
+
+/// 元素级 hover 瞬时态（无动画、self-contained）：复用 titlebar `ctrl_button` 已验证的
+/// `window.use_keyed_state(key, cx, |_, _| false)` 姿势——不新增 MusicView 字段、不改 mod.rs。
+/// 返回 `(状态句柄, 当前是否悬停)`：
+/// - 渲染期用 `hovered` 布尔直接决定底色/前色；
+/// - 状态句柄 `.clone()` 交给 `.on_hover`（[`hover_listener`]），进入/离开写回布尔，经
+///   `observe_keyed_state` 观察订阅自动通知当前视图重绘（瞬时切换、无动画）。
+/// `key` 取元素唯一标识（导航标签/歌单名…），多实例元素各自独立互不覆盖。
+fn hover_state(window: &mut Window, cx: &mut Context<MusicView>, key: String) -> (Entity<bool>, bool) {
+    #[cfg(test)]
+    let reg_key = key.clone();
+    let st = window.use_keyed_state(key, cx, |_, _| false);
+    #[cfg(test)]
+    hover_registry().lock().unwrap().insert(reg_key, st.clone());
+    let hovered = *st.read(cx);
+    (st, hovered)
+}
+
+/// 由 hover 状态句柄构造 `.on_hover` 监听：进入/离开写回布尔 + 显式重绘当前视图
+/// （对齐 titlebar `ctrl_button` 双重通知姿势：`observe_keyed_state` 观察 + `cx.notify`）。
+fn hover_listener(
+    window: &mut Window,
+    st: &Entity<bool>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    let st = st.clone();
+    let view_id = window.current_view();
+    move |hovered, _w, cx| {
+        st.update(cx, |h, _| *h = *hovered);
+        cx.notify(view_id);
+    }
+}
+
+/// 测试只读通道：`hover_state` 把创建的 keyed 状态句柄登记到此注册表，测试经
+/// [`hover_read`] 读取「悬停后状态翻转」。判别式：撤掉元素 `.on_hover` 的状态写回 → 恒 false → 测试红。
+#[cfg(test)]
+fn hover_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, Entity<bool>>> {
+    use std::sync::LazyLock;
+    static REG: LazyLock<std::sync::Mutex<std::collections::HashMap<String, Entity<bool>>>> =
+        LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    &REG
+}
+
+/// 读某元素当前 hover 状态（未登记 → false）。测试在「先渲染一帧再读」后调用，
+/// 此时注册表已被本测试上下文内最新渲染刷新，不会读到异构上下文的悬空句柄。
+#[cfg(test)]
+pub(super) fn hover_read(key: &str, cx: &App) -> bool {
+    match hover_registry().lock().unwrap().get(key) {
+        Some(st) => *st.read(cx),
+        None => false,
+    }
+}
 
 /// 导航项行为：切换分区 / 打开歌单详情（`usize` = `mix_groups` 下标）。
 /// `OpenPlaylist` 保留为「歌单型导航项」的动作枚举；当前歌单条目（C3）在
@@ -27,7 +78,7 @@ impl super::MusicView {
     /// 左侧导航栏整块。
     pub(super) fn render_sidebar(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let menu_border = theme::border();
@@ -43,9 +94,9 @@ impl super::MusicView {
             .border_color(menu_border)
             .overflow_y_scroll()
             .child(self.render_logo())
-            .child(self.render_menu_group("菜单", cx, &mut self.nav_items_menu()))
-            .child(self.render_menu_group("我的", cx, &mut self.nav_items_mine()))
-            .child(self.render_playlists(cx))
+            .child(self.render_menu_group("菜单", window, cx, &mut self.nav_items_menu()))
+            .child(self.render_menu_group("我的", window, cx, &mut self.nav_items_mine()))
+            .child(self.render_playlists(window, cx))
             .child(self.render_user_card())
             .into_any_element()
     }
@@ -99,6 +150,7 @@ impl super::MusicView {
     fn render_menu_group(
         &mut self,
         title: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
         items: &mut Vec<(IconName, &'static str, NavAction)>,
     ) -> AnyElement {
@@ -114,7 +166,7 @@ impl super::MusicView {
                 .into_any_element(),
         );
         for (icon, label, action) in items {
-            children.push(self.render_nav_item(*icon, label, *action, cx));
+            children.push(self.render_nav_item(window, *icon, label, *action, cx));
         }
         div()
             .flex()
@@ -124,9 +176,10 @@ impl super::MusicView {
             .into_any_element()
     }
 
-    /// 单个导航项（含 active 高亮 + 左缘竖条）。
+    /// 单个导航项（含 active 高亮 + 左缘竖条 + hover 变亮）。
     fn render_nav_item(
         &mut self,
+        window: &mut Window,
         icon: IconName,
         label: &'static str,
         action: NavAction,
@@ -136,10 +189,14 @@ impl super::MusicView {
             NavAction::Section(s) => self.state.section == s,
             NavAction::OpenPlaylist(i) => self.state.section == MainSection::Playlist(i),
         };
-        let (fg, bg) = if active {
-            (theme::text(), theme::accent().opacity(0.18))
+        // hover 瞬时态：key 用导航标签（首页/发现…唯一）。active 保持既有高亮（hover 不覆盖）。
+        let (st, hovered) = hover_state(window, cx, format!("music-nav-hover-{label}"));
+        let (fg, base_bg, bg_alpha) = if active {
+            (theme::text(), theme::accent().opacity(0.18), 0.25)
+        } else if hovered {
+            (theme::text(), theme::bg_hover(), 0.6)
         } else {
-            (theme::text2(), theme::bg_hover())
+            (theme::text2(), theme::bg_hover(), 0.0)
         };
         let cl = cx.listener(move |this: &mut MusicView, _ev, _w, cx| match action {
             NavAction::Section(s) => this.set_section(s, cx),
@@ -155,8 +212,9 @@ impl super::MusicView {
             .py(px(10.))
             .relative()
             .cursor(CursorStyle::PointingHand)
-            .bg(bg.opacity(if active { 0.25 } else { 0.0 }))
+            .bg(base_bg.opacity(bg_alpha))
             .on_click(cl)
+            .on_hover(hover_listener(window, &st))
             .child(
                 // 左缘 3px accent 竖条（active）。
                 div()
@@ -201,8 +259,8 @@ impl super::MusicView {
     }
 
     /// 「歌单」组：由 `mix_groups` 前 5 项生成（色点 = 组渐变首色）；点击打开对应歌单详情
-    /// （当前项高亮：左缘 accent 竖条 + accent 底，观感对齐其他导航项）。
-    fn render_playlists(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// （当前项高亮：左缘 accent 竖条 + accent 底，观感对齐其他导航项）+ hover 变亮。
+    fn render_playlists(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mut title = vec![div()
             .px(px(24.))
             .pb(px(12.))
@@ -221,10 +279,14 @@ impl super::MusicView {
             .collect();
         for (i, (name, dot)) in groups.into_iter().enumerate() {
             let active = self.state.section == MainSection::Playlist(i);
-            let (fg, bg) = if active {
-                (theme::text(), theme::accent().opacity(0.18))
+            // hover 瞬时态：key 用歌单名称（唯一）；active 保持既有高亮（hover 不覆盖）。
+            let (st, hovered) = hover_state(window, cx, format!("music-playlist-hover-{name}"));
+            let (fg, base_bg, bg_alpha) = if active {
+                (theme::text(), theme::accent().opacity(0.18), 0.25)
+            } else if hovered {
+                (theme::text(), theme::bg_hover(), 0.6)
             } else {
-                (theme::text2(), theme::bg_hover())
+                (theme::text2(), theme::bg_hover(), 0.0)
             };
             let id = format!("music-playlist-{name}");
             let sel = name.clone();
@@ -242,8 +304,9 @@ impl super::MusicView {
                     .py(px(8.))
                     .relative()
                     .cursor(CursorStyle::PointingHand)
-                    .bg(bg.opacity(if active { 0.25 } else { 0.0 }))
+                    .bg(base_bg.opacity(bg_alpha))
                     .on_click(cl)
+                    .on_hover(hover_listener(window, &st))
                     .child(
                         // 左缘 3px accent 竖条（active，对齐其他导航项）。
                         div()

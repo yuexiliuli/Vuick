@@ -26,6 +26,7 @@ use crate::model::RepeatMode;
 use crate::player::MusicPlayer;
 use crate::scrub::ScrubState;
 
+use super::buttons::{hover_state, icon_btn};
 use super::icon::{IconView, MusicIcon};
 use super::{IntoIconElement, MusicView, RightTab, theme};
 use ui::icon::{Icon, IconName};
@@ -189,8 +190,8 @@ impl Render for BottomBarView {
             .bg(theme::bg_primary())
             .border_t_1()
             .border_color(theme::border())
-            .child(self.render_bb_song(title, artist, (light, dark), cur_liked, cx))
-            .child(self.render_bb_center(cx))
+            .child(self.render_bb_song(window, title, artist, (light, dark), cur_liked, cx))
+            .child(self.render_bb_center(window, cx))
             .child(self.render_bb_right(window, cx))
     }
 }
@@ -199,6 +200,7 @@ impl BottomBarView {
     /// 左列（280px）：缩略图渐变 + 歌名/艺术家 + 心形。
     fn render_bb_song(
         &mut self,
+        window: &mut Window,
         title: String,
         artist: String,
         (light, dark): (gpui::Hsla, gpui::Hsla),
@@ -278,33 +280,35 @@ impl BottomBarView {
                             .child(artist),
                     ),
             )
-            .child(
-                div()
-                    .id("bb-like")
-                    .debug_selector(|| "bb-like".into())
-                    .relative()
-                    .cursor(CursorStyle::PointingHand)
-                    .on_click(cl)
-                    .on_hover(self.hover_listener(
-                        "收藏",
-                        self.tip_cells.get("bb-like").cloned().unwrap_or_default(),
-                    ))
-                    .child(
-                        theme::bounds_canvas(
-                            self.tip_cells.get("bb-like").cloned().unwrap_or_default(),
-                        ),
-                    )
-                    .child(
-                        Icon::new(if liked { IconName::Heart } else { IconName::HeartBorder })
-                            .size(px(18.))
-                            .text_color(if liked { theme::pink() } else { theme::text3() }),
-                    ),
-            )
+            .child({
+                // bb-like 统一 `icon_btn`：auto 盒 → 固定 24px 对齐（原 auto≈18px）。
+                let cell = self.tip_cells.get("bb-like").cloned().unwrap_or_default();
+                let tip_fn = self.hover_listener("收藏", cell.clone());
+                icon_btn(
+                    window,
+                    cx,
+                    "bb-like",
+                    "bb-like-hover".to_string(),
+                    if liked { IconName::Heart } else { IconName::HeartBorder },
+                    18.,
+                    24.,
+                    12.,
+                    None,
+                    liked,
+                    theme::text3(),
+                    theme::text(),
+                    Some(theme::pink()),
+                    None,
+                    cell,
+                    tip_fn,
+                    cl,
+                )
+            })
             .into_any_element()
     }
 
     /// 中列（flex_1）：控制行 + 进度条 + 时间。
-    fn render_bb_center(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_bb_center(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let dur = p.duration();
         let pos = p.position();
@@ -332,11 +336,11 @@ impl BottomBarView {
                     .flex()
                     .items_center()
                     .gap_x(px(14.))
-                    .child(self.bb_icon(IconName::Shuffle, 20., shuffle, "bb-shuffle", true, cx))
-                    .child(self.bb_icon(MusicIcon::Prev, 20., false, "bb-prev", false, cx))
-                    .child(self.bb_main_btn(cx))
-                    .child(self.bb_icon(MusicIcon::Next, 20., false, "bb-next", false, cx))
-                    .child(self.bb_repeat(repeat, cx)),
+                    .child(self.bb_icon(window, IconName::Shuffle, 20., shuffle, "bb-shuffle", true, cx))
+                    .child(self.bb_icon(window, MusicIcon::Prev, 20., false, "bb-prev", false, cx))
+                    .child(self.bb_main_btn(window, cx))
+                    .child(self.bb_icon(window, MusicIcon::Next, 20., false, "bb-next", false, cx))
+                    .child(self.bb_repeat(window, repeat, cx)),
             )
             .child(
                 div()
@@ -366,9 +370,11 @@ impl BottomBarView {
             .into_any_element()
     }
 
-    /// 中列小型图标钮（shuffle/prev/next）。
+    /// 中列小型图标钮（shuffle/prev/next）：统一 [`icon_btn`]，hover 前色 + 半透明圆底；
+    /// active 保持 accent_light 高亮（hover 不覆盖）；tooltip 文案由 tip_writer 提供。
     fn bb_icon<I: IntoIconElement>(
         &mut self,
+        window: &mut Window,
         icon: I,
         size: f32,
         active: bool,
@@ -376,11 +382,11 @@ impl BottomBarView {
         _toggle: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tip: Option<&'static str> = match id {
-            "bb-shuffle" => Some("随机播放"),
-            "bb-prev" => Some("上一首"),
-            "bb-next" => Some("下一首"),
-            _ => None,
+        let tip: &'static str = match id {
+            "bb-shuffle" => "随机播放",
+            "bb-prev" => "上一首",
+            "bb-next" => "下一首",
+            _ => "未知",
         };
         let parent = self.parent.clone();
         let cl = cx.listener(move |_this: &mut BottomBarView, _ev, _w, cx| {
@@ -395,33 +401,32 @@ impl BottomBarView {
                 _ => parent.clone().update(cx, |mv, cx| mv.toggle_shuffle(cx)),
             };
         });
-        let mut el = div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .w(px(size))
-            .h(px(size))
-            .relative()
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cl)
-            .child(
-                icon.icon_element(
-                    px(size),
-                    if active { theme::accent_light() } else { theme::text2() },
-                ),
-            );
-        if let Some(t) = tip {
-            let cell = self.tip_cells.get(id).cloned().unwrap_or_default();
-            el = el.on_hover(self.hover_listener(t, cell.clone()));
-            el = el.child(theme::bounds_canvas(cell));
-        }
-        el.into_any_element()
+        let cell = self.tip_cells.get(id).cloned().unwrap_or_default();
+        let tip_fn = self.hover_listener(tip, cell.clone());
+        icon_btn(
+            window,
+            cx,
+            id,
+            format!("{id}-hover"),
+            icon,
+            size,
+            size,
+            size / 2.0,
+            None,
+            active,
+            theme::text2(),
+            theme::text(),
+            Some(theme::accent_light()),
+            None,
+            cell,
+            tip_fn,
+            cl,
+        )
     }
 
-    /// 中列主播放钮（36px accent 圆）。
-    fn bb_main_btn(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// 中列主播放钮（36px accent 圆）：统一 [`icon_btn`]，fill_bg 注入 accent 实心圆底、
+    /// hover 叠白淡显。
+    fn bb_main_btn(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let playing = p.playing();
         let icon = if playing { MusicIcon::Pause } else { MusicIcon::Play };
@@ -429,68 +434,67 @@ impl BottomBarView {
         let cl = cx.listener(move |_this: &mut BottomBarView, _ev, _w, cx| {
             let _ = parent.clone().update(cx, |mv, cx| mv.toggle_play(cx));
         });
-        div()
-            .id("bb-play")
-            .debug_selector(|| "bb-play".into())
-            .w(px(36.))
-            .h(px(36.))
-            .relative()
-            .rounded(px(18.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::accent())
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cl)
-            .on_hover(self.hover_listener(
-                "播放/暂停",
-                self.tip_cells.get("bb-play").cloned().unwrap_or_default(),
-            ))
-            .child(
-                theme::bounds_canvas(
-                    self.tip_cells.get("bb-play").cloned().unwrap_or_default(),
-                ),
-            )
-            .child(IconView::new(icon).size(px(20.)).text_color(theme::text()))
-            .into_any_element()
+        let cell = self.tip_cells.get("bb-play").cloned().unwrap_or_default();
+        let tip_fn = self.hover_listener("播放/暂停", cell.clone());
+        let accent_fill =
+            div().absolute().inset_0().rounded(px(18.)).bg(theme::accent()).into_any_element();
+        icon_btn(
+            window,
+            cx,
+            "bb-play",
+            "bb-play-hover".to_string(),
+            icon,
+            20.,
+            36.,
+            18.,
+            None,
+            false,
+            theme::text(),
+            theme::text(),
+            None,
+            Some(accent_fill),
+            cell,
+            tip_fn,
+            cl,
+        )
     }
 
-    fn bb_repeat(&mut self, repeat: RepeatMode, cx: &mut Context<Self>) -> AnyElement {
+    fn bb_repeat(
+        &mut self,
+        window: &mut Window,
+        repeat: RepeatMode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let active = repeat != RepeatMode::Off;
         let parent = self.parent.clone();
         let cl = cx.listener(move |_this: &mut BottomBarView, _ev, _w, cx| {
             let _ = parent.clone().update(cx, |mv, cx| mv.cycle_repeat(cx));
         });
-        div()
-            .id("bb-repeat")
-            .debug_selector(|| "bb-repeat".into())
-            .relative()
-            .w(px(20.))
-            .h(px(20.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cl)
-            .on_hover(self.hover_listener(
-                "循环播放",
-                self.tip_cells.get("bb-repeat").cloned().unwrap_or_default(),
-            ))
-            .child(
-                theme::bounds_canvas(
-                    self.tip_cells.get("bb-repeat").cloned().unwrap_or_default(),
-                ),
-            )
-            .child(
-                Icon::new(IconName::Repeat)
-                    .size(px(18.))
-                    .text_color(if active { theme::accent_light() } else { theme::text2() }),
-            )
-            .into_any_element()
+        let cell = self.tip_cells.get("bb-repeat").cloned().unwrap_or_default();
+        let tip_fn = self.hover_listener("循环播放", cell.clone());
+        icon_btn(
+            window,
+            cx,
+            "bb-repeat",
+            "bb-repeat-hover".to_string(),
+            IconName::Repeat,
+            18.,
+            20.,
+            10.,
+            None,
+            active,
+            theme::text2(),
+            theme::text(),
+            Some(theme::accent_light()),
+            None,
+            cell,
+            tip_fn,
+            cl,
+        )
     }
 
     /// 右列（240px）：歌词/队列 tab 钮 + 音量（图标 + 条）+ 全屏钮。
-    fn render_bb_right(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_bb_right(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let volume = p.volume();
         let vol_strip = self.strip_element(
@@ -509,8 +513,8 @@ impl BottomBarView {
             .items_center()
             .justify_end()
             .gap_x(px(12.))
-            .child(self.bb_tab_toggle(IconName::Lyrics, RightTab::Lyrics, "bb-lyrics", cx))
-            .child(self.bb_tab_toggle(IconName::QueueMusic, RightTab::Queue, "bb-queue", cx))
+            .child(self.bb_tab_toggle(window, IconName::Lyrics, RightTab::Lyrics, "bb-lyrics", cx))
+            .child(self.bb_tab_toggle(window, IconName::QueueMusic, RightTab::Queue, "bb-queue", cx))
             .child(
                 div()
                     .flex()
@@ -521,39 +525,43 @@ impl BottomBarView {
                     )
                     .child(vol_strip),
             )
-            .child(
-                div()
-                    .id("bb-fs")
-                    .debug_selector(|| "bb-fs".into())
-                    .relative()
-                    .cursor(CursorStyle::PointingHand)
-                    .on_click({
-                        let parent = self.parent.clone();
-                        cx.listener(move |_this: &mut BottomBarView, _ev, _w, cx| {
-                            let _ = parent.clone().update(cx, |mv, cx| mv.toggle_fs(cx));
-                        })
-                    })
-                    .on_hover(self.hover_listener(
-                        "全屏",
-                        self.tip_cells.get("bb-fs").cloned().unwrap_or_default(),
-                    ))
-                    .child(
-                        theme::bounds_canvas(
-                            self.tip_cells.get("bb-fs").cloned().unwrap_or_default(),
-                        ),
-                    )
-                    .child(
-                        Icon::new(IconName::Fullscreen)
-                            .size(px(18.))
-                            .text_color(theme::text2()),
-                    ),
-            )
+            .child({
+                // bb-fs 统一 `icon_btn`：auto 盒 → 固定 24px 对齐。
+                let cell = self.tip_cells.get("bb-fs").cloned().unwrap_or_default();
+                let tip_fn = self.hover_listener("全屏", cell.clone());
+                let parent = self.parent.clone();
+                let cl = cx.listener(move |_this: &mut BottomBarView, _ev, _w, cx| {
+                    let _ = parent.clone().update(cx, |mv, cx| mv.toggle_fs(cx));
+                });
+                icon_btn(
+                    window,
+                    cx,
+                    "bb-fs",
+                    "bb-fs-hover".to_string(),
+                    IconName::Fullscreen,
+                    18.,
+                    24.,
+                    12.,
+                    None,
+                    false,
+                    theme::text2(),
+                    theme::text(),
+                    None,
+                    None,
+                    cell,
+                    tip_fn,
+                    cl,
+                )
+            })
             .into_any_element()
     }
 
     /// 右列歌词/队列 tab 钮：切右侧面板 tab（回父 `set_right_tab`，父状态真变）。
+    /// 非图标钮不进 [`icon_btn`]：就地补 hover（仿 right tab）——keyed hover 态 + 非 active
+    /// 时 `bg_hover` pill 淡底 + 前色变亮；active 保持 accent 实底。
     fn bb_tab_toggle(
         &mut self,
+        window: &mut Window,
         icon: IconName,
         tab: RightTab,
         id: &'static str,
@@ -570,18 +578,47 @@ impl BottomBarView {
             let _ = parent.clone().update(cx, |mv, cx| mv.set_right_tab(tab, cx));
         });
         let cell = self.tip_cells.get(id).cloned().unwrap_or_default();
+        // tab hover 瞬时态（key 用钮 id）+ 既有 tooltip on_hover 合并为同一监听。
+        let (st, hovered) = hover_state(window, cx, format!("bb-tab-hover-{id}"));
+        let tip_fn = self.hover_listener(tip, cell.clone());
+        let view_id = window.current_view();
+        let st_for = st.clone();
+        let on_hover = move |hovered: &bool, w: &mut Window, cx: &mut App| {
+            st_for.update(cx, |h, _| *h = *hovered);
+            cx.notify(view_id);
+            tip_fn(hovered, w, cx);
+        };
+        let bg = if active {
+            theme::accent()
+        } else if hovered {
+            theme::bg_hover()
+        } else {
+            gpui::transparent_black()
+        };
+        let fg = if active || hovered {
+            theme::text()
+        } else {
+            theme::text2()
+        };
         div()
             .id(id)
             .debug_selector(move || id.to_string())
             .relative()
+            .w(px(24.))
+            .h(px(24.))
+            .rounded(px(6.))
+            .bg(bg)
+            .flex()
+            .items_center()
+            .justify_center()
             .cursor(CursorStyle::PointingHand)
             .on_click(cl)
-            .on_hover(self.hover_listener(tip, cell.clone()))
+            .on_hover(on_hover)
             .child(theme::bounds_canvas(cell))
             .child(
                 Icon::new(icon)
                     .size(px(18.))
-                    .text_color(if active { theme::accent_light() } else { theme::text2() }),
+                    .text_color(fg),
             )
             .into_any_element()
     }

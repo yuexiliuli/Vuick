@@ -23,6 +23,7 @@
 
 pub mod theme;
 mod bottom;
+pub(super) mod buttons;
 mod fullscreen;
 mod icon;
 mod lyrics;
@@ -260,6 +261,9 @@ pub struct MusicView {
     main_guess_scroll: ScrollHandle,
     /// 发现页「最近添加」横滑滚动句柄：`track_scroll` 绑定行内 `#discover-recent-scroll`。
     main_recent_scroll: ScrollHandle,
+    /// 右栏「队列」tab 独立滚动句柄（`track_scroll` 绑定队列列表滚动容器 `#music-queue-scroll`）：
+    /// 队列虚拟化——整树重渲只物化可视窗（±缓冲）行，避免 O(N) 全量 `to_vec()`+全量物化。
+    queue_scroll: ScrollHandle,
     /// 主区「过滤/分组显示模型」缓存（`(分区, 搜索词)` → `(库变更计数, Rc<显示模型>)`）：
     /// 同一搜索词且 `player.mutation()` 不变则复用——消除每帧重过滤 + `Vec<Track>` 深克隆。
     main_list_cache: HashMap<(MainSection, String), (u64, Rc<main::MainList>)>,
@@ -346,6 +350,7 @@ impl MusicView {
             main_mix_scroll: ScrollHandle::new(),
             main_guess_scroll: ScrollHandle::new(),
             main_recent_scroll: ScrollHandle::new(),
+            queue_scroll: ScrollHandle::new(),
             main_list_cache: HashMap::new(),
             main_sb_shown: Rc::new(Cell::new(false)),
             eq_main: cx.new(|_| widgets::EqBarsView::new(player_for_views.clone(), "row-current")),

@@ -24,7 +24,7 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, CursorStyle, InteractiveElement as _, IntoElement, ObjectFit,
+    AnyElement, App, Context, CursorStyle, Entity, InteractiveElement as _, IntoElement, ObjectFit,
     ParentElement as _, RenderImage, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _,
     StyledImage, Window, div, img, px,
 };
@@ -42,6 +42,54 @@ use super::{MainSection, MusicView, theme};
 use ui::icon::{Icon, IconName};
 use ui::input::{Input as UiInput, InputEvent, InputState};
 use ui::scrollbar::{Scrollbar as UiScrollbar, ScrollbarMode};
+
+/// 元素级 hover 瞬时态（无动画、self-contained）：复用 titlebar `ctrl_button` 已验证的
+/// `window.use_keyed_state(key, cx, |_, _| false)` 姿势——不新增 MusicView 字段、不改 mod.rs。
+/// 返回 `(状态句柄, 当前是否悬停)`；句柄 `.clone()` 交给 `.on_hover`（[`hover_listener`]）。
+/// `key` 取元素唯一标识（歌曲行/心形/加队列用 idx…），多实例元素各自独立互不覆盖。
+fn hover_state(window: &mut Window, cx: &mut Context<MusicView>, key: String) -> (Entity<bool>, bool) {
+    #[cfg(test)]
+    let reg_key = key.clone();
+    let st = window.use_keyed_state(key, cx, |_, _| false);
+    #[cfg(test)]
+    hover_registry().lock().unwrap().insert(reg_key, st.clone());
+    let hovered = *st.read(cx);
+    (st, hovered)
+}
+
+/// 由 hover 状态句柄构造 `.on_hover` 监听：进入/离开写回布尔 + 显式重绘当前视图
+/// （对齐 titlebar `ctrl_button` 双重通知姿势：`observe_keyed_state` 观察 + `cx.notify`）。
+fn hover_listener(
+    window: &mut Window,
+    st: &Entity<bool>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    let st = st.clone();
+    let view_id = window.current_view();
+    move |hovered, _w, cx| {
+        st.update(cx, |h, _| *h = *hovered);
+        cx.notify(view_id);
+    }
+}
+
+/// 测试只读通道：`hover_state` 把创建的 keyed 状态句柄登记到此注册表，测试经
+/// [`hover_read`] 读取「悬停后状态翻转」。判别式：撤掉元素 `.on_hover` 的状态写回 → 恒 false → 测试红。
+#[cfg(test)]
+fn hover_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, Entity<bool>>> {
+    use std::sync::LazyLock;
+    static REG: LazyLock<std::sync::Mutex<std::collections::HashMap<String, Entity<bool>>>> =
+        LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    &REG
+}
+
+/// 读某元素当前 hover 状态（未登记 → false）。测试在「先渲染一帧再读」后调用，
+/// 此时注册表已被本测试上下文内最新渲染刷新，不会读到异构上下文的悬空句柄。
+#[cfg(test)]
+pub(super) fn hover_read(key: &str, cx: &App) -> bool {
+    match hover_registry().lock().unwrap().get(key) {
+        Some(st) => *st.read(cx),
+        None => false,
+    }
+}
 
 /// 主区横向内边距（px，左右同值）：`#music-main` 内容区留白；overlay 滚动条用
 /// `right(-MAIN_PAD_X)` 贴主区右缘（跨过右 padding），两端共用同一常量防漂移。
@@ -489,7 +537,7 @@ impl super::MusicView {
 
     // ---- Home：我的推荐 Mix 卡 + 热门歌曲表 ----
 
-    fn render_home(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_home(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // Home 整页并入 `#music-list` 单一竖向虚拟滚动：「我的推荐」（标题+Mix 卡横滑行）+
         // 「热门歌曲」（标题+表头）都在滚动区内的固定高虚拟项里，随歌曲行一起滚；
         // 问候/搜索头部保持固定（用户点名范围外）。空库/空命中头部仍占位稳定。
@@ -499,7 +547,7 @@ impl super::MusicView {
             .min_h(px(0.))
             .flex()
             .flex_col()
-            .child(self.render_list(&list, cx))
+            .child(self.render_list(&list, window, cx))
             .into_any_element()
     }
 
@@ -762,7 +810,7 @@ impl super::MusicView {
 
     // ---- Library / Liked ----
 
-    fn render_library(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_library(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let list = self.main_list_for(MainSection::Library, cx);
         let scanning = {
             let p = self.player.read(cx);
@@ -781,12 +829,12 @@ impl super::MusicView {
             } else if list.total == 0 {
                 super::empty_state("暂无歌曲", "点开一个音乐文件夹加载曲库").into_any_element()
             } else {
-                self.render_list(&list, cx)
+                self.render_list(&list, window, cx)
             })
             .into_any_element()
     }
 
-    fn render_liked(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_liked(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let list = self.main_list_for(MainSection::Liked, cx);
         div()
             .flex_1()
@@ -797,14 +845,14 @@ impl super::MusicView {
             .child(if list.total == 0 {
                 super::empty_state("还没有收藏", "点歌曲行右边的心形即可收藏").into_any_element()
             } else {
-                self.render_list(&list, cx)
+                self.render_list(&list, window, cx)
             })
             .into_any_element()
     }
 
     /// 最近播放：本次会话播放历史（最近先、同曲去重置顶；与 Liked 同款「路径集过滤 +
     /// 搜索词过滤」记入列表显示模型）。历史为空 → 空态。
-    fn render_recent(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_recent(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let list = self.main_list_for(MainSection::Recent, cx);
         div()
             .flex_1()
@@ -815,40 +863,40 @@ impl super::MusicView {
             .child(if list.total == 0 {
                 super::empty_state("暂无播放记录", "本会话播放过的歌曲会出现在这里").into_any_element()
             } else {
-                self.render_list(&list, cx)
+                self.render_list(&list, window, cx)
             })
             .into_any_element()
     }
 
     // ---- 发现：艺术家网格 + 猜你喜欢 + 最近添加（整页并入 `#music-list` 竖向虚拟滚动） ----
 
-    fn render_discover(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_discover(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let list = self.main_list_for(MainSection::Discover, cx);
         div()
             .flex_1()
             .min_h(px(0.))
             .flex()
             .flex_col()
-            .child(self.render_list(&list, cx))
+            .child(self.render_list(&list, window, cx))
             .into_any_element()
     }
 
     // ---- 电台：英雄卡（虚拟列表内单个固定高项）----
 
-    fn render_radio(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_radio(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let list = self.main_list_for(MainSection::Radio, cx);
         div()
             .flex_1()
             .min_h(px(0.))
             .flex()
             .flex_col()
-            .child(self.render_list(&list, cx))
+            .child(self.render_list(&list, window, cx))
             .into_any_element()
     }
 
     // ---- 本地下载：全库按搜索词过滤的歌曲表（不按收藏过滤）----
 
-    fn render_downloads(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_downloads(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let list = self.main_list_for(MainSection::Downloads, cx);
         div()
             .flex_1()
@@ -865,7 +913,7 @@ impl super::MusicView {
                     .flex()
                     .flex_col()
                     .child(self.render_song_header())
-                    .child(self.render_list(&list, cx))
+                    .child(self.render_list(&list, window, cx))
                     .into_any_element()
             })
             .into_any_element()
@@ -875,7 +923,7 @@ impl super::MusicView {
 
     fn render_playlist(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
         gi: usize,
     ) -> AnyElement {
@@ -896,7 +944,7 @@ impl super::MusicView {
             .child(if !has_tracks {
                 super::empty_state("暂无歌曲", "该歌单没有歌曲").into_any_element()
             } else {
-                self.render_list(&list, cx)
+                self.render_list(&list, window, cx)
             })
             .into_any_element()
     }
@@ -1261,7 +1309,12 @@ impl super::MusicView {
     /// （= [`MainList::total_h`]，全范围可滚）；屏外行不物化、不画渐变、不建 debug_selector。
     /// 外层包 `relative` 供右侧 overlay 滚动条（[`Self::main_scrollbar`]）叠放（absolute 不随
     /// 内容滚）；滚动容器本身仍 flex_1 撑满。
-    fn render_list(&mut self, list: &Rc<MainList>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_list(
+        &mut self,
+        list: &Rc<MainList>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let scroll_y = (-self.main_scroll.offset().y.as_f32()).max(0.0);
         let viewport = self.main_scroll.bounds().size.height.as_f32();
         let (first, last) = list.visible_range(scroll_y, viewport);
@@ -1278,7 +1331,7 @@ impl super::MusicView {
             // （其活动区域 = 本滚动容器边界），此处不再逐字刷新滚动条状态。
             .child(div().h(px(top_h)))
             .children((first..last).map(|i| match &items[i] {
-                MainItem::Row { idx, rank } => self.song_row(*idx, *rank, cx),
+                MainItem::Row { idx, rank } => self.song_row(*idx, *rank, window, cx),
                 MainItem::GroupHeader { artist, count } => self.group_header(artist, *count),
                 MainItem::HomeRecTitle => self.home_rec_title(),
                 MainItem::HomeMixRow => self.home_mix_row(cx),
@@ -1441,7 +1494,7 @@ impl super::MusicView {
     /// 点击播该行；播放中行高亮 accent 文字 / 序号换按均衡器小柱。
     /// 虚拟化侧只对**可视窗行**调用；内部按 `idx` 借库引用读显示字段（只克隆文本字段，
     /// 不克隆整个 `Track`——性能优化第二步）。库越界（缓存未刷新拍）兜底空行。
-    fn song_row(&mut self, idx: usize, rank: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn song_row(&mut self, idx: usize, rank: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = self.player.read(cx);
         let is_current = p.current() == Some(idx);
         let playing = p.playing() && is_current;
@@ -1461,6 +1514,11 @@ impl super::MusicView {
             )
         };
         let (light, dark) = theme::gradient_pair_of(grad);
+        // 行 hover + 行内两个小钮（心形/加队列）各自独立的 hover 态：key 均带唯一 idx，
+        // 互不覆盖（视觉可叠加：行底 + 钮圆底同时亮）。
+        let (row_st, row_hovered) = hover_state(window, cx, format!("song-row-hover-{idx}"));
+        let (like_st, like_hovered) = hover_state(window, cx, format!("song-like-hover-{idx}"));
+        let (que_st, que_hovered) = hover_state(window, cx, format!("song-que-hover-{idx}"));
         let row = div()
             .id(format!("song-row-{idx}"))
             .debug_selector(move || format!("song-row-{idx}"))
@@ -1471,12 +1529,33 @@ impl super::MusicView {
             .py(px(7.))
             .h(px(ROW_H))
             .rounded(px(8.))
+            // 显式 relative：hover 覆盖层 absolute.inset_0() 的定位祖先 = 本行。
+            // （gpui 的 Position 默认即 Relative，此处为意图自明 + 防误读的防御性声明，
+            //   与 sidebar 用户卡头像「relative + absolute.inset_0」同款先例。）
+            .relative()
             .cursor(CursorStyle::PointingHand)
             .bg(if is_current { theme::bg_card() } else { theme::bg_card().opacity(0.0) })
             .on_click(cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
                 this.handle_play_idx(idx, cx);
-            }));
-        // 序号列：播放中 = 均衡器动画（独立子视图，动画只重绘它、不带动整树）；否则纯数字。
+            }))
+            .on_hover(hover_listener(window, &row_st))
+            // 行 hover 覆盖层：absolute 铺满整行、圆角同行，先于其余子元素绘制（文字/图在上）。
+            // current 行已有不透明 bg_card 底 → 叠 0.4 亮化；普通行底透明 → 叠 0.6 更明显。
+            // debug_selector 供几何回归断言「覆盖层盒==行盒」（作用域=本行，防锚错容器）。
+            .child(
+                div()
+                    .debug_selector(move || format!("song-row-hover-overlay-{idx}"))
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(8.))
+                    .bg(theme::bg_hover().opacity(if row_hovered {
+                        if is_current { 0.4 } else { 0.6 }
+                    } else {
+                        0.0
+                    })),
+            );
+        // 序号列：播放中 = 均衡器动画（独立子视图，动画只重绘它、不带动整树）；否则纯数字
+        // （行 hover 时 text3→text2 微亮）。
         let num = if playing {
             self.eq_main.clone().into_any_element()
         } else {
@@ -1487,7 +1566,7 @@ impl super::MusicView {
                 .items_center()
                 .justify_center()
                 .text_size(px(13.))
-                .text_color(theme::text3())
+                .text_color(if row_hovered { theme::text2() } else { theme::text3() })
                 .child((rank + 1).to_string())
                 .into_any_element()
         };
@@ -1524,9 +1603,14 @@ impl super::MusicView {
                                 .child(title),
                         )
                         .child(
+                            // 艺术家：行 hover 时 text3→text2 微亮（对齐序号）。
                             div()
                                 .text_size(px(12.))
-                                .text_color(theme::text3())
+                                .text_color(if row_hovered {
+                                    theme::text2()
+                                } else {
+                                    theme::text3()
+                                })
                                 .text_ellipsis()
                                 .child(artist),
                         ),
@@ -1557,6 +1641,7 @@ impl super::MusicView {
         .child(
             // 行级「下一首播放（加入队列）」钮：加在当前行之后（不打断播放）；等宽小图标
             // 列（参照心形钮 w40 / 17 图标），`stop_propagation` 防触发行播放。
+            // hover：图标 text3→text2 变亮 + 28px 半透明圆底（独立 key，不与行 hover 互斥）。
             div()
                 .id(format!("song-que-{idx}"))
                 .debug_selector(move || format!("song-que-{idx}"))
@@ -1565,34 +1650,69 @@ impl super::MusicView {
                 .items_center()
                 .justify_center()
                 .cursor(CursorStyle::PointingHand)
-                .text_color(theme::text3())
                 .on_click(cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
                     this.add_to_queue_row(idx, cx);
                     cx.stop_propagation();
                 }))
+                .on_hover(hover_listener(window, &que_st))
                 .child(
-                    Icon::new(IconName::PlaylistAdd)
-                        .size(px(17.))
-                        .text_color(theme::text3()),
+                    // 加队列钮自身 28px 半透明圆底（hover 亮），独立于行 hover。
+                    div()
+                        .size(px(28.))
+                        .rounded(px(14.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(if que_hovered {
+                            theme::bg_hover().opacity(0.6)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .child(
+                            Icon::new(IconName::PlaylistAdd)
+                                .size(px(17.))
+                                .text_color(if que_hovered { theme::text2() } else { theme::text3() }),
+                        ),
                 ),
         )
         .child(
+            // 心形钮：liked 保持 pink 语义（hover 不覆盖）；未收藏 hover → text3→text2 + 圆底。
             div()
                 .id(format!("song-like-{idx}"))
+                .debug_selector(move || format!("song-like-{idx}"))
                 .w(px(40.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor(CursorStyle::PointingHand)
-                .text_color(if liked { theme::pink() } else { theme::text3() })
                 .on_click(cx.listener(move |this: &mut MusicView, _ev, _w, cx| {
                     this.toggle_like(idx, cx);
                     cx.stop_propagation();
                 }))
+                .on_hover(hover_listener(window, &like_st))
                 .child(
-                    Icon::new(if liked { IconName::Heart } else { IconName::HeartBorder })
-                        .size(px(17.))
-                        .text_color(if liked { theme::pink() } else { theme::text3() }),
+                    div()
+                        .size(px(28.))
+                        .rounded(px(14.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(if like_hovered {
+                            theme::bg_hover().opacity(0.6)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .child(
+                            Icon::new(if liked { IconName::Heart } else { IconName::HeartBorder })
+                                .size(px(17.))
+                                .text_color(if liked {
+                                    theme::pink()
+                                } else if like_hovered {
+                                    theme::text2()
+                                } else {
+                                    theme::text3()
+                                }),
+                        ),
                 ),
         )
         .into_any_element()

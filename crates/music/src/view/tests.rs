@@ -2372,7 +2372,8 @@ fn hover_move_between_buttons_switches_name(cx: &mut TestAppContext) {
     );
 }
 
-/// 用例 T4：全屏 fs-shuffle 悬停 → 名称出现 + 既有 `fs_hover` 高亮仍工作（不回归）。
+/// 用例 T4：全屏 fs-shuffle 悬停 → 名称出现 + keyed hover 高亮翻转（fs 按钮第 2/3 步已迁
+/// `buttons::icon_btn`，不再写 `fs_hover`；`fs_hover` 字段专留给进度/音量条悬停圆点）。
 #[gpui::test]
 fn hover_fs_button_keeps_highlight_and_tip(cx: &mut TestAppContext) {
     let player = player_with_library(cx);
@@ -2393,11 +2394,218 @@ fn hover_fs_button_keeps_highlight_and_tip(cx: &mut TestAppContext) {
         Some("随机播放"),
         "全屏 fs-shuffle 悬停应设名称提示"
     );
-    let fs_hover = wcx.cx.read(|app| view.read(app).fs_hover);
-    assert_eq!(fs_hover, Some("fs-shuffle"), "既有 fs_hover 高亮应仍被设置");
+    assert!(
+        hover_is_on(wcx, "fs-shuffle-hover"),
+        "fs-shuffle 悬停应置 keyed hover 高亮（撤 icon_btn 内 hover 状态写回=红）"
+    );
     wcx.executor().advance_clock(Duration::from_millis(600));
     wcx.run_until_parked();
     assert!(tooltip_showing(&view, wcx), "全屏钮满 500ms 也应显示浮层");
+}
+
+// ---- 第 2/3 步：底栏/全屏图标钮迁 `buttons::icon_btn` 后的 hover 高亮 + tooltip 收口 ----
+
+/// B 组：底栏图标钮（shuffle/prev/next/like/fs/repeat/play）迁 [`icon_btn`] 后，各钮悬停 →
+/// `bb-*-hover` keyed 状态翻转；重绘一帧钮盒仍在（高亮渲染路径不 panic / 不丢元素）。
+/// 判别式：撤掉 `icon_btn` 内 hover 状态写回（只画底不改状态）→ 恒 false → 红。
+#[gpui::test]
+fn hover_bb_icons_show_hover_highlight(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let cases: &[&str] = &[
+        "bb-shuffle",
+        "bb-prev",
+        "bb-next",
+        "bb-like",
+        "bb-fs",
+        "bb-repeat",
+        "bb-play",
+    ];
+    for sel in cases {
+        assert!(wcx.debug_bounds(sel).is_some(), "前置：{sel} 应有 debug 盒");
+        hover_button(wcx, sel);
+        assert!(
+            hover_is_on(wcx, &format!("{sel}-hover")),
+            "悬停 {sel} 应置 bb hover 高亮（撤 icon_btn 内 hover 状态写回=红）"
+        );
+    }
+    // 重绘一帧：钮盒仍在（高亮背景层渲染路径不 panic、不丢元素布局）。
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("bb-play").is_some(), "重绘后 bb-play 盒应仍在");
+    assert!(wcx.debug_bounds("bb-like").is_some(), "重绘后 bb-like 盒应仍在");
+    assert!(wcx.debug_bounds("bb-fs").is_some(), "重绘后 bb-fs 盒应仍在");
+}
+
+/// B 组：底栏歌词/队列 tab 分段钮（非 [`icon_btn`]，就地 keyed hover + pill）→ 悬停置
+/// hover 态、移开复位（默认右侧面板在 Song，两 tab 均非 active）。判别式：撤掉 `bb_tab_toggle`
+/// 内 `hover_state` 状态写回 → 恒 false → 红。
+#[gpui::test]
+fn hover_bb_lyrics_queue_tabs_highlight(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    for sel in ["bb-lyrics", "bb-queue"] {
+        assert!(wcx.debug_bounds(sel).is_some(), "前置：{sel} 应有 debug 盒");
+        hover_button(wcx, sel);
+        assert!(
+            hover_is_on(wcx, &format!("bb-tab-hover-{sel}")),
+            "悬停 {sel} 应置 tab hover 态"
+        );
+        unhover(wcx);
+        assert!(
+            !hover_is_on(wcx, &format!("bb-tab-hover-{sel}")),
+            "移开 {sel} tab hover 应复位"
+        );
+    }
+}
+
+/// B 组：全屏迁移钮（shuffle/prev/next/play/repeat/like/que/dl/顶栏分享）逐钮悬停 → 各自
+/// tooltip 文案 + keyed hover 高亮；满 500ms `music-tooltip` 浮层真渲染。判别式：撤掉
+/// `icon_btn` 的 `tip_writer` 注入（只写 hover 不回 tip）→ tip 恒 None → 红。
+#[gpui::test]
+fn hover_fs_migrated_buttons_tooltip_and_highlight(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_fs(cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    let cases: &[(&str, &str, &str)] = &[
+        ("fs-btn-分享", "分享", "fs-btn-分享-hover"),
+        ("fs-shuffle", "随机播放", "fs-shuffle-hover"),
+        ("fs-prev", "上一首", "fs-prev-hover"),
+        ("fs-next", "下一首", "fs-next-hover"),
+        ("fs-play", "播放/暂停", "fs-play-hover"),
+        ("fs-repeat", "循环播放", "fs-repeat-hover"),
+        ("fs-like", "收藏", "fs-like-hover"),
+        ("fs-que", "加入队列", "fs-que-hover"),
+        ("fs-dl", "下载", "fs-dl-hover"),
+    ];
+    for (sel, tip, key) in cases {
+        assert!(wcx.debug_bounds(sel).is_some(), "前置：{sel} 应有 debug 盒");
+        hover_button(wcx, sel);
+        assert_eq!(
+            tooltip_text(&view, wcx).as_deref(),
+            Some(*tip),
+            "悬停 {sel} 应设对应名称提示"
+        );
+        assert!(
+            hover_is_on(wcx, key),
+            "悬停 {sel} 应置 fs keyed hover 高亮"
+        );
+        unhover(wcx);
+    }
+    // 满 TOOLTIP_SHOW_MS → 浮层真渲染（render_tooltip 产出 debug 盒）。
+    hover_button(wcx, "fs-play");
+    assert!(!tooltip_showing(&view, wcx), "未满 500ms 应不显示浮层");
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert!(tooltip_showing(&view, wcx), "满 500ms fs-play 浮层应可见");
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("music-tooltip").is_some(),
+        "fs 迁移钮浮层应实际渲染出 debug 盒"
+    );
+}
+
+/// B 组：fs 进度/音量条（未迁移）悬停仍走 `fs_hover` 字段（护「勿拆」——按钮已不写
+/// `fs_hover`，该字段专留给条悬停圆点）。判别式：撤掉 fs-prog/fs-vol 的 bar `on_hover`
+/// → `fs_hover` 恒 None → 红。注：`#fs-prog`/`#fs-vol` 容器无 debug_selector，悬停按
+/// `fs_progress`/`fs_vol` 真实窗口盒坐标（Slider on_geometry 每帧回写）驱动 on_hover；
+/// 以显式窗口尺寸定布局（默认窗过高档内容溢出、音量条在屏外）。
+#[gpui::test]
+fn fs_prog_vol_keep_fs_hover_field(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_fs(cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 1200×900：左右两栏 + 控制/音量行均在屏内（1200 宽容纳左 320 + gap80 + 歌词 440）。
+    wcx.simulate_resize(gpui::size(px(1200.), px(900.)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    let (prog_c, vol_c) = wcx.cx.read(|app| {
+        let v = view.read(app);
+        (
+            v.fs_progress.get().center(),
+            v.fs_vol.get().center(),
+        )
+    });
+    assert!(
+        prog_c.x.as_f32() > 0.0 && vol_c.x.as_f32() > 0.0,
+        "fs 条盒应已布局（宽>0），prog={prog_c:?} vol={vol_c:?}"
+    );
+    // 干净起跳（先离角落清任何悬停）→ 悬停进度条 → fs_hover 写该条 id。
+    unhover(wcx);
+    wcx.simulate_mouse_move(prog_c, None, Default::default());
+    wcx.run_until_parked();
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).fs_hover),
+        Some("fs-prog"),
+        "fs-prog 悬停应写 fs_hover（条高亮专用，撤 bar on_hover=红）"
+    );
+    // 回角落清场（fs-prog leave 把 fs_hover 写 None）→ 再悬停音量条 → 写 fs-vol。
+    unhover(wcx);
+    wcx.simulate_mouse_move(vol_c, None, Default::default());
+    wcx.run_until_parked();
+    assert_eq!(
+        wcx.cx.read(|app| view.read(app).fs_hover),
+        Some("fs-vol"),
+        "fs-vol 悬停应写 fs_hover（条高亮专用，撤 bar on_hover=红）"
+    );
+}
+
+/// 冒烟：底栏 + 全屏全部迁移钮逐个悬停 + `window.draw().clear()` 重绘一帧不 panic
+/// （headless 渲染路径完整走通，含 hover 背景层/fill_bg/tab pill 各分支）。
+#[gpui::test]
+fn hover_all_migrated_buttons_no_panic(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    for sel in [
+        "bb-like",
+        "bb-shuffle",
+        "bb-prev",
+        "bb-play",
+        "bb-next",
+        "bb-repeat",
+        "bb-lyrics",
+        "bb-queue",
+        "bb-fs",
+    ] {
+        if let Some(b) = wcx.debug_bounds(sel) {
+            wcx.simulate_mouse_move(at_frac(&b, 0.5), None, Default::default());
+            wcx.run_until_parked();
+            wcx.update(|window, app| window.draw(app).clear(app));
+            wcx.run_until_parked();
+        }
+    }
+    wcx.update(|window, app| {
+        view.update(app, |v, cx| v.toggle_fs(cx));
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    for sel in [
+        "fs-btn-分享",
+        "fs-shuffle",
+        "fs-prev",
+        "fs-play",
+        "fs-next",
+        "fs-repeat",
+        "fs-like",
+        "fs-que",
+        "fs-dl",
+    ] {
+        if let Some(b) = wcx.debug_bounds(sel) {
+            wcx.simulate_mouse_move(at_frac(&b, 0.5), None, Default::default());
+            wcx.run_until_parked();
+            wcx.update(|window, app| window.draw(app).clear(app));
+            wcx.run_until_parked();
+        }
+    }
 }
 
 // ---- 全屏「退出清残留 tooltip」回归（根因：退出全屏 = 浮层整体从树移除，其 hover-leave
@@ -4986,4 +5194,420 @@ async fn add_to_queue_button_places_next(cx: &mut TestAppContext) {
     });
     assert_eq!(q4[qpos4], 1, "全屏 current=1 真位不变");
     assert_eq!(q4.len(), q3.len(), "全屏对当前曲点「加入队列」应 no-op");
+}
+
+// ---- hover 视觉反馈（瞬时切换、无动画）：可点击元素悬停 → keyed 状态翻转；移开复位 ----
+// 机制：`window.use_keyed_state`（titlebar `ctrl_button` 同款），测试经各产出模块的
+// `#[cfg(test)]` 注册表（`hover_read`）读「悬停后状态翻转」。判别式：撤掉元素 `.on_hover`
+// 内的状态写回 → 本组测试读 hover 恒 false → 红。
+// 口径：headless 断言「状态字段翻转 + 渲染路径不 panic」；hover 后底色/前色的**真实观感
+// （bg_hover 淡底 / text2→text 微亮）**待真机验证（gpui headless 无像素通道）。
+
+/// 读取某 keyed hover 状态（按产出模块分派到对应注册表；未登记 → false）。
+fn hover_is_on(wcx: &mut VisualTestContext, key: &str) -> bool {
+    wcx.cx.read(|app| {
+        super::sidebar::hover_read(key, app)
+            || super::main::hover_read(key, app)
+            || super::buttons::hover_read(key, app)
+    })
+}
+
+/// 移开鼠标到窗口角（不悬停任何待测元素）→ 触发 on_hover(false) 复位。
+fn unhover(wcx: &mut VisualTestContext) {
+    wcx.simulate_mouse_move(gpui::Point::new(px(4.), px(4.)), None, Default::default());
+    wcx.run_until_parked();
+}
+
+/// H1 侧栏导航项 hover：悬停「首页」→ 状态翻转；移开 → 复位。
+#[gpui::test]
+fn hover_sidebar_nav_item_flips_then_resets(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let key = "music-nav-hover-首页";
+    assert!(wcx.debug_bounds("music-nav-首页").is_some(), "前置：导航项已渲染");
+    assert!(!hover_is_on(wcx, key), "前置：未悬停 → false");
+    hover_button(wcx, "music-nav-首页");
+    assert!(hover_is_on(wcx, key), "悬停导航项应置 hover 状态");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, key), "移开后 hover 状态应复位");
+}
+
+/// H2 侧栏歌单条目 hover：悬停「周杰伦」歌单行 → 状态翻转；移开 → 复位。
+#[gpui::test]
+fn hover_sidebar_playlist_flips_then_resets(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let key = "music-playlist-hover-周杰伦";
+    assert!(
+        wcx.debug_bounds("music-playlist-周杰伦").is_some(),
+        "前置：歌单行已渲染"
+    );
+    assert!(!hover_is_on(wcx, key), "前置：未悬停 → false");
+    hover_button(wcx, "music-playlist-周杰伦");
+    assert!(hover_is_on(wcx, key), "悬停歌单条目应置 hover 状态");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, key), "移开后 hover 状态应复位");
+}
+
+/// H3 主列表歌曲行 + 行内心形/加队列钮：三者 hover **独立翻转、并存不互斥**
+/// （行 key、钮 key 各自唯一；悬停钮同时触发行 hover，视觉叠加）。
+#[gpui::test]
+fn hover_song_row_and_inrow_buttons_are_independent(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let row_key = "song-row-hover-0";
+    let like_key = "song-like-hover-0";
+    let que_key = "song-que-hover-0";
+    assert!(wcx.debug_bounds("song-row-0").is_some(), "前置：首页歌曲行已物化");
+    assert!(!hover_is_on(wcx, row_key) && !hover_is_on(wcx, like_key) && !hover_is_on(wcx, que_key));
+    // 悬停行中部（标题区）→ 仅行 hover，行内钮不被误触发。
+    hover_button(wcx, "song-row-0");
+    assert!(hover_is_on(wcx, row_key), "悬停行应置行 hover");
+    assert!(
+        !hover_is_on(wcx, like_key) && !hover_is_on(wcx, que_key),
+        "行 hover 不驱动行内钮 hover（key 互斥独立）"
+    );
+    unhover(wcx);
+    // 悬停心形钮 → 心形钮 + 行两者都 hover（并存不互斥）。
+    hover_button(wcx, "song-like-0");
+    assert!(hover_is_on(wcx, like_key), "悬停心形钮应置钮 hover");
+    assert!(hover_is_on(wcx, row_key), "钮在行内 → 行 hover 同时为 true（并存不互斥）");
+    unhover(wcx);
+    assert!(
+        !hover_is_on(wcx, like_key) && !hover_is_on(wcx, row_key),
+        "移开心形钮应复位钮与行"
+    );
+    // 加队列钮独立翻转。
+    hover_button(wcx, "song-que-0");
+    assert!(hover_is_on(wcx, que_key), "悬停加队列钮应置钮 hover");
+    // 可视代理：hover 态下重绘一帧 → 行/钮 debug 盒仍在（渲染路径不 panic）。
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("song-row-0").is_some(), "hover 态重绘后行仍渲染");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, que_key), "移开加队列钮应复位");
+}
+
+/// H4 右栏 tab 钮 hover：悬停「队列」tab → 状态翻转；移开 → 复位。
+#[gpui::test]
+fn hover_right_tab_flips_then_resets(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let key = "rp-tab-hover-rp-tab-queue";
+    assert!(wcx.debug_bounds("rp-tab-queue").is_some(), "前置：队列 tab 已渲染");
+    assert!(!hover_is_on(wcx, key), "前置：未悬停 → false");
+    hover_button(wcx, "rp-tab-queue");
+    assert!(hover_is_on(wcx, key), "悬停右栏 tab 应置 hover 状态");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, key), "移开后 hover 状态应复位");
+}
+
+/// H5 播放控制小钮 hover：随机/上一首/下一首/循环 + 播放主钮（各一条，抽查随机 + 主钮）。
+#[gpui::test]
+fn hover_np_controls_flip_then_reset(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    // 随机（np_control）
+    assert!(wcx.debug_bounds("np-随机播放").is_some(), "前置：随机钮已渲染");
+    let rk = "np-ctl-hover-随机播放";
+    assert!(!hover_is_on(wcx, rk));
+    hover_button(wcx, "np-随机播放");
+    assert!(hover_is_on(wcx, rk), "悬停随机钮应置 hover");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, rk), "移开随机钮复位");
+    // 播放主钮（np_play_main，accent 圆）
+    assert!(wcx.debug_bounds("np-play").is_some(), "前置：播放主钮已渲染");
+    let pk = "np-play-hover";
+    hover_button(wcx, "np-play");
+    assert!(hover_is_on(wcx, pk), "悬停播放主钮应置 hover");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, pk), "移开播放主钮复位");
+    // 循环钮（np_repeat）
+    assert!(wcx.debug_bounds("np-repeat").is_some(), "前置：循环钮已渲染");
+    let rk2 = "np-repeat-hover";
+    hover_button(wcx, "np-repeat");
+    assert!(hover_is_on(wcx, rk2), "悬停循环钮应置 hover");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, rk2), "移开循环钮复位");
+}
+
+/// H6 附加钮 hover：悬停「收藏」（right-like）→ 状态翻转；移开 → 复位。
+#[gpui::test]
+fn hover_extra_button_flips_then_resets(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let key = "extra-hover-right-like";
+    assert!(wcx.debug_bounds("right-like").is_some(), "前置：附加钮已渲染");
+    assert!(!hover_is_on(wcx, key), "前置：未悬停 → false");
+    hover_button(wcx, "right-like");
+    assert!(hover_is_on(wcx, key), "悬停附加钮应置 hover 状态");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, key), "移开后 hover 状态应复位");
+}
+
+/// H7 队列行 hover（队列 tab）：悬停 queue-item-1（非当前行）→ 状态翻转；移开复位。
+#[gpui::test]
+fn hover_queue_row_flips_then_resets(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, _| p.test_start_playing(0));
+    });
+    let (view, wcx) = open_tooltip_view(cx, player);
+    // 切到队列 tab 并重绘一帧（队列行进入渲染 + hover 注册表登记）。
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.right_tab = RightTab::Queue);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("queue-item-1").is_some(), "前置：队列行已渲染");
+    let key = "queue-item-hover-1";
+    assert!(!hover_is_on(wcx, key), "前置：未悬停 → false");
+    hover_button(wcx, "queue-item-1");
+    assert!(hover_is_on(wcx, key), "悬停队列行应置 hover 状态");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, key), "移开后 hover 状态应复位");
+}
+
+/// B 组：`queue_visible_range` 纯函数——空/首帧兜底/缓冲夹紧/滚动偏移反查（期望由公式手算）。
+#[test]
+fn queue_visible_range_pure() {
+    let qvr = super::right::queue_visible_range;
+    // 空队列。
+    assert_eq!(qvr(0, 0.0, 400.0, 4), (0, 0), "空队列恒空窗");
+    // 首帧 viewport=0 → 兜底物化前 8 行（len.min(8)）。
+    assert_eq!(qvr(100, 0.0, 0.0, 4), (0, 8), "viewport=0 兜底 8 行");
+    assert_eq!(qvr(5, 0.0, 0.0, 4), (0, 5), "兜底不超过 len");
+    // 顶部可视窗：viewport=560（10 行）+ 缓冲 4 → last=14 夹 20。
+    assert_eq!(qvr(20, 0.0, 560.0, 4), (0, 14), "顶窗 last=ceil(10)+4=14");
+    // 滚动偏移反查：scroll=840（15 行）→ first=15-4=11；scroll+viewport=1400 → ceil(25)
+    // =25 → last=25+4=29（夹 40）。
+    assert_eq!(qvr(40, 840.0, 560.0, 4), (11, 29), "滚动反查 first/last");
+    // 缓冲夹紧：viewport=40（1 行）→ last=ceil(40/56)+4=5。
+    assert_eq!(qvr(100, 0.0, 40.0, 4), (0, 5), "缓冲夹紧 last");
+    // 中部滚动：窗口非空（last>first 防空窗）。
+    let (f, l) = qvr(100, 5000.0, 40.0, 4);
+    assert_eq!(f, (5000.0f64 / 56.0).floor() as usize - 4, "first 含下缓冲");
+    assert!(l > f, "窗口恒非空：{f}..{l}");
+    assert_eq!(l, 94, "last=ceil((5000+40)/56)+4=90+4=94");
+}
+
+/// B 组：队列 tab 虚拟化（right.rs `render_queue_list`）——大队列（400 首）只物化可视窗
+/// ±缓冲行：尾行 `queue-item-399` 不物化、物化行数 << 400；滚动后再排首行出屏、中部行物化。
+/// 判别式：撤虚拟化（全量物化所有行）→ 尾部恒物化=红。
+#[gpui::test]
+fn queue_list_virtualizes_only_materializes_visible(cx: &mut TestAppContext) {
+    let player = library_with_n(cx, 400);
+    // 播放首曲：queue 空 → 建全库队列（0..400）。
+    cx.update(|app| {
+        player.update(app, |p, _| p.test_start_playing(0));
+    });
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player.clone(), cx));
+    // 固定窗口（右栏可视窗 ~几十行内），切队列 tab 渲染。
+    wcx.simulate_resize(gpui::size(px(1200.), px(900.)));
+    wcx.update(|window, app| {
+        view.update(app, |v, _| v.state.right_tab = RightTab::Queue);
+        window.draw(app).clear(app);
+    });
+    wcx.run_until_parked();
+    // 二次绘制：队列容器首帧 bounds 未布局 → 走 `queue_visible_range` 首帧兜底（8 行），
+    // 布局后第二帧按真实视口物化全窗；断言以「已布局帧」为准（同 render_queue_list 注释）。
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    // 首窗：顶部行物化（含缓冲窗内近端几行）；页面中部/尾部行不物化（debug_bounds 仅接受
+    // `&'static str`，故用代表性静态下标断言「物化窗局限顶部 ~±缓冲」——判别式：撤虚拟化
+    // 全量物化 → 尾部恒物化=红）。
+    assert!(
+        wcx.debug_bounds("queue-item-0").is_some(),
+        "首窗应物化顶部行"
+    );
+    assert!(
+        wcx.debug_bounds("queue-item-5").is_some() && wcx.debug_bounds("queue-item-10").is_some(),
+        "首窗近端行应物化"
+    );
+    assert!(
+        wcx.debug_bounds("queue-item-50").is_none(),
+        "首窗页外中部行不应物化（虚拟化只物化可视窗±缓冲）"
+    );
+    assert!(
+        wcx.debug_bounds("queue-item-399").is_none(),
+        "尾部行不应物化（撤虚拟化=红）"
+    );
+    // 滚到第 300 行（300×56px）→ 该行物化、首行出屏、中部页外/尾部仍不物化。
+    let handle = wcx.cx.read(|app| view.read(app).queue_scroll.clone());
+    handle.set_offset(gpui::point(
+        px(0.),
+        px(-(super::right::QUEUE_ROW_H * 300.0)),
+    ));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("queue-item-300").is_some(),
+        "滚到第 300 行后该行应物化"
+    );
+    assert!(
+        wcx.debug_bounds("queue-item-0").is_none(),
+        "滚到中部后首行应出屏（不物化）"
+    );
+    assert!(
+        wcx.debug_bounds("queue-item-100").is_none() && wcx.debug_bounds("queue-item-399").is_none(),
+        "滚到中部后中部页外/尾部行仍不物化"
+    );
+}
+
+/// H8「即将播放」行 hover（歌曲 tab 底部）：悬停 up-next-1 → 状态翻转；移开复位。
+/// 该行在右栏底部，先把窗口加高避免命中点越出窗口（Default 1280×800 下也够，加高更稳）。
+#[gpui::test]
+fn hover_up_next_row_flips_then_resets(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    cx.update(|app| {
+        player.update(app, |p, _| p.test_start_playing(0));
+    });
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    wcx.simulate_resize(gpui::size(px(1280.), px(1100.)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(wcx.debug_bounds("up-next-1").is_some(), "前置：up-next 行已渲染");
+    let key = "up-next-hover-1";
+    assert!(!hover_is_on(wcx, key), "前置：未悬停 → false");
+    hover_button(wcx, "up-next-1");
+    assert!(hover_is_on(wcx, key), "悬停「即将播放」行应置 hover 状态");
+    unhover(wcx);
+    assert!(!hover_is_on(wcx, key), "移开后 hover 状态应复位");
+}
+
+/// H9 回归：右栏 tab 钮 / 附加钮的 hover 视觉与 tooltip **合并进同一 `.on_hover`** 后，
+/// tooltip 仍照常记录出现 / 按钮间切换 / 离开清除（防后续改坏「悬停仍弹浮层」）。
+/// 判别式：合并闭包若丢掉 `hover_tip_listener` 调用（只写 hover 状态不回 tip）
+/// → tip 恒 None → 本测试红。多钮残留语义对齐 mod.rs `hover_tip_listener`：
+/// 「离开只清本钮文案」——从 tab 直接换到附加钮时，tab 的 leave 不得误清新钮 tip。
+#[gpui::test]
+fn hover_right_tab_and_extra_still_show_tooltip(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    // 1) 悬停右栏歌词 tab → tooltip 记录立即出现（合并闭包仍调 hover_tip_listener）。
+    hover_button(wcx, "rp-tab-lyrics");
+    assert_eq!(
+        tooltip_text(&view, wcx).as_deref(),
+        Some("歌词"),
+        "悬停右栏 tab 应设对应名称提示（合并闭包未丢 tooltip）"
+    );
+    // 2) 直接换到附加钮「收藏」（不经过移开）→ 文案切换为新钮，tab 的 leave
+    //    （「离开只清本钮文案」）不得清掉新钮 tip（多钮残留回归）。
+    hover_button(wcx, "right-like");
+    assert_eq!(
+        tooltip_text(&view, wcx).as_deref(),
+        Some("收藏"),
+        "从 tab 换到附加钮应切为新钮文案（tab leave 不清新钮 tip）"
+    );
+    // 3) 满 TOOLTIP_SHOW_MS → 浮层真的渲染（render_tooltip 产出 debug 盒）。
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert!(tooltip_showing(&view, wcx), "满 500ms 附加钮浮层应可见");
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("music-tooltip").is_some(),
+        "附加钮浮层应实际渲染出 debug 盒"
+    );
+    // 4) 移开 → tip 按本钮文案匹配清除，无残留。
+    unhover(wcx);
+    assert!(tooltip_text(&view, wcx).is_none(), "移开附加钮应清空提示");
+}
+
+/// H10 几何回归：歌曲行 hover 覆盖层必须作用于**行自身**（盒 == 行盒、同尺寸同位），
+/// 不得把整个列表区刷上 bg_hover 淡底。判别式：若覆盖层 `absolute().inset_0()` 锚错
+/// 定位祖先（如外层列表容器）→ 其盒远大于行盒 → 下方对齐/尺寸断言红。
+#[gpui::test]
+fn song_row_hover_overlay_is_scoped_to_row(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (_view, wcx) = open_tooltip_view(cx, player);
+    let row = wcx
+        .debug_bounds("song-row-0")
+        .expect("前置：歌曲行已物化");
+    let ov = wcx
+        .debug_bounds("song-row-hover-overlay-0")
+        .expect("前置：行 hover 覆盖层已记录 debug 盒");
+    let (rx, ry) = (
+        row.origin.x.as_f32(),
+        row.origin.y.as_f32(),
+    );
+    let (ox, oy) = (ov.origin.x.as_f32(), ov.origin.y.as_f32());
+    assert!(
+        (rx - ox).abs() < 0.5 && (ry - oy).abs() < 0.5,
+        "覆盖层应完全对齐行盒原点：row@{:?} vs overlay@{:?}",
+        row,
+        ov
+    );
+    assert!(
+        (row.size.width.as_f32() - ov.size.width.as_f32()).abs() < 0.5
+            && (row.size.height.as_f32() - ov.size.height.as_f32()).abs() < 0.5,
+        "覆盖层尺寸应等于行盒：row@{:?} vs overlay@{:?}",
+        row,
+        ov
+    );
+}
+
+/// N1 右栏统一图标钮（np 控制区，第 1/4 步迁到 `buttons::icon_btn`）tooltip：逐钮悬停 →
+/// 各自名称提示；满 TOOLTIP_SHOW_MS → `music-tooltip` 浮层真渲染。判别式：撤掉 `icon_btn`
+/// 的 `tip_writer` 注入（只写 hover 不回 tip）→ tip 恒 None → 本测试红。
+#[gpui::test]
+fn hover_np_controls_now_show_tooltip(cx: &mut TestAppContext) {
+    let player = player_with_library(cx);
+    let (view, wcx) = open_tooltip_view(cx, player);
+    let cases: &[(&str, &str)] = &[
+        ("np-随机播放", "随机播放"),
+        ("np-上一首", "上一首"),
+        ("np-下一首", "下一首"),
+        ("np-play", "播放/暂停"),
+        ("np-repeat", "循环播放"),
+    ];
+    for (sel, expect) in cases {
+        assert!(wcx.debug_bounds(sel).is_some(), "前置：{sel} 应有 debug 盒");
+        hover_button(wcx, sel);
+        assert_eq!(
+            tooltip_text(&view, wcx).as_deref(),
+            Some(*expect),
+            "悬停 {sel} 应设对应名称提示"
+        );
+        unhover(wcx);
+        assert!(tooltip_text(&view, wcx).is_none(), "移开 {sel} 应清空提示");
+    }
+    // 满 TOOLTIP_SHOW_MS → 浮层真的渲染（render_tooltip 产出 debug 盒）。
+    hover_button(wcx, "np-play");
+    assert!(!tooltip_showing(&view, wcx), "未满 500ms 应不显示浮层");
+    wcx.executor().advance_clock(Duration::from_millis(600));
+    wcx.run_until_parked();
+    assert!(tooltip_showing(&view, wcx), "满 500ms np-play 浮层应可见");
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        wcx.debug_bounds("music-tooltip").is_some(),
+        "np 钮浮层应实际渲染出 debug 盒"
+    );
+}
+
+/// N2 纯函数：active 优先于 hover——like pink / shuffle・repeat accent_light 不被 hover 覆盖。
+/// 判别式：把「active 先于 hover 判定」的顺序对调 → hover 返回 hover 色 → 本测试红。
+#[gpui::test]
+fn icon_btn_fg_resolves_active_over_hover() {
+    assert_eq!(
+        super::buttons::resolve_fg(true, true, theme::text2(), theme::text(), Some(theme::pink())),
+        theme::pink(),
+        "active + hover 并存：active 语义色优先，hover 不得覆盖"
+    );
+    assert_eq!(
+        super::buttons::resolve_fg(false, true, theme::text2(), theme::text(), None),
+        theme::text(),
+        "非 active 悬停 → 回落 hover 色"
+    );
+    assert_eq!(
+        super::buttons::resolve_fg(false, false, theme::text2(), theme::text(), None),
+        theme::text2(),
+        "静止 → 常态色 text2"
+    );
+    assert_eq!(
+        super::buttons::resolve_fg(true, false, theme::text2(), theme::text(), None),
+        theme::text(),
+        "active 且无 active 色 → 回落 hover 色（仍受 hover 点亮）"
+    );
 }
