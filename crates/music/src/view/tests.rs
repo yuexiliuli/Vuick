@@ -4455,3 +4455,161 @@ async fn follow_palette_tracks_global_theme_change(cx: &mut TestAppContext) {
         "follow 应重取被 custom 覆盖的 accent"
     );
 }
+
+// ---- 诊断（2026-11-23）：静态音乐皮肤 vs 全局换肤隔离性取证 ----
+
+/// 全帧纯色 quad 的 RGB 色集合（升序、去重、**忽略 alpha**）：供「换帧前后色集合一致 /
+/// 无全局色漏入」断言。忽略 alpha：同色不同透明档（如白色弱化叠层）不视为新色。
+fn solid_quad_rgb_set(wcx: &mut VisualTestContext) -> Vec<u32> {
+    let quads = wcx.update(|window, _| window.painted_quads());
+    let to_rgb = |c: gpui::Hsla| -> u32 {
+        let r: gpui::Rgba = c.into();
+        ((r.r * 255.).round() as u32) << 16 | ((r.g * 255.).round() as u32) << 8 | (r.b * 255.).round() as u32
+    };
+    let mut v: Vec<u32> = quads
+        .iter()
+        .filter_map(|q| q.background.as_solid().map(to_rgb))
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// 帧内是否存在「RGB 精确匹配 + alpha 落在容忍带」的纯色 quad（区分同 RGB 白弱化叠层与
+/// 高不透明面板：白色弱化 alpha≈0.06~0.5、浮层面板 alpha≈0.92）。
+fn frame_has_quad_like(wcx: &mut VisualTestContext, rgb: (u8, u8, u8), alpha: f32) -> bool {
+    let quads = wcx.update(|window, _| window.painted_quads());
+    quads
+        .iter()
+        .filter_map(|q| q.background.as_solid())
+        .any(|c| {
+            let r: gpui::Rgba = c.into();
+            let rr = ((r.r * 255.).round() as u8, (r.g * 255.).round() as u8, (r.b * 255.).round() as u8);
+            rr == rgb && (c.a - alpha).abs() < 0.02
+        })
+}
+
+/// **(x) 判别红测**：music_skin 为非 follow 预设（"music"）时，改**全局主题**（music 暗档 →
+/// default 亮档）**不得重染音乐窗内容/局部控件**。判别式（K201）：若音乐改随全局——把
+/// `bg_deep` 换成全局亮档面坡、或任一面读 `Theme::global` 换色——本测试红。断言：
+/// ① 判别器（全局确实已切亮且 accent 已异化，防空转）；② 根实绘 bg 逐字节保持 music
+/// bg_deep；③ 换肤前后整帧纯色 RGB 集合**完全一致**（无任何全局色漏入音乐窗）。
+#[gpui::test]
+async fn static_music_skin_not_recolored_by_global_theme_change(cx: &mut TestAppContext) {
+    let _guard = SkinViewGuard::new();
+    // 起点：全局 = music 暗档（合并后已知值）。
+    cx.update(|cx| {
+        ui::theme::Theme::apply(
+            ui::theme::ThemeSpec {
+                mode: ui::theme::ThemeMode::Dark,
+                preset: ui::theme::PRESETS.iter().find(|p| p.id == "music").unwrap(),
+                custom: Default::default(),
+            },
+            cx,
+        );
+    });
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    // 显式静态音乐皮肤（非 follow）。
+    wcx.update(|_w, app| view.update(app, |v, cx| v.choose_music_skin("music", cx)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    // 基线帧 A：根实绘 bg == music bg_deep + 全帧纯色 RGB 集合。
+    let root_a = root_bg_paint_color(wcx);
+    assert_eq!(
+        root_a,
+        theme::MusicPalette::from_skin("music").expect("music 预设可解析").bg_deep,
+        "基线：静态 music 皮肤根背景应为音乐 bg_deep"
+    );
+    let set_a = solid_quad_rgb_set(wcx);
+    assert!(!set_a.is_empty(), "基线帧应含纯色 quad");
+    // 判别器：全局切为 default 亮档（surface≈白，与音乐深紫完全相异）。
+    wcx.update(|_w, app| {
+        ui::theme::Theme::apply(
+            ui::theme::ThemeSpec {
+                mode: ui::theme::ThemeMode::Light,
+                preset: ui::theme::PRESETS.iter().find(|p| p.id == "default").unwrap(),
+                custom: Default::default(),
+            },
+            app,
+        );
+    });
+    wcx.run_until_parked();
+    let (is_dark, global_accent) = wcx.update(|_w, app| {
+        let t = ui::theme::Theme::global(app);
+        (t.is_dark(), t.colors.accent)
+    });
+    assert!(!is_dark, "判别：全局应已切为亮档（否则本测试空转）");
+    assert_ne!(
+        global_accent, gpui::rgb(theme::ACCENT),
+        "判别：全局 accent 应与音乐 accent（#7c5cfc）异化（否则未真换肤）"
+    );
+    // 重绘后：根背景不变（(x) 假）+ 全帧 RGB 集合不变（无全局色漏入）。
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert_eq!(
+        root_bg_paint_color(wcx),
+        root_a,
+        "(x) 判别：全局换肤不得重染音乐根背景"
+    );
+    let set_b = solid_quad_rgb_set(wcx);
+    assert_eq!(
+        set_b, set_a,
+        "(y) 判别：全局换肤前后整帧纯色 RGB 集合应一致——无 ui::theme::Theme::global 色漏入音乐窗"
+    );
+}
+
+/// (y) 取证：音乐窗内**唯一**读全局 `Theme` 的面 = 换肤子菜单弹层（`ui::menu`）——弹层面板
+/// /条目前景取 `Theme::global` 的 surface/fg/menu_highlight（crates/ui/src/menu.rs:887/782），
+/// **不随音乐皮肤**。全局亮档 + 音乐静态深紫时，弹层面板 = 全局亮 surface（≈白，alpha≈0.92）
+/// 漏入音乐窗。本测试把当前（有泄漏）行为钉死为「已知依赖面清单」一项，供隔离工作以
+/// 「弹层改用音乐皮肤色则本测试红」为判别式翻转。
+#[gpui::test]
+async fn skin_popup_panel_uses_global_theme_surface(cx: &mut TestAppContext) {
+    let _guard = SkinViewGuard::new();
+    cx.update(|cx| {
+        ui::theme::Theme::apply(
+            ui::theme::ThemeSpec {
+                mode: ui::theme::ThemeMode::Light,
+                preset: ui::theme::PRESETS.iter().find(|p| p.id == "default").unwrap(),
+                custom: Default::default(),
+            },
+            cx,
+        );
+    });
+    let player = player_with_library(cx);
+    let (view, wcx) = cx.add_window_view(|_w, cx| MusicView::new(player, cx));
+    wcx.update(|_w, app| view.update(app, |v, cx| v.choose_music_skin("music", cx)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    // 全局亮档 surface（弹层面板底色预期）+ 弹层不透明 alpha。
+    let (surface_rgb, panel_alpha) = wcx.update(|_w, app| {
+        let c: gpui::Rgba = ui::theme::Theme::global(app).colors.surface;
+        (
+            ((c.r * 255.).round() as u8, (c.g * 255.).round() as u8, (c.b * 255.).round() as u8),
+            ui::theme::FLOAT_ACRYLIC_ALPHA_LIGHT,
+        )
+    });
+    // 菜单未开：帧内无「全局亮 surface + 高不透明」面板色（排除白色弱化叠层 alpha≈0.06~0.5）。
+    assert!(
+        !frame_has_quad_like(wcx, surface_rgb, panel_alpha),
+        "菜单未开时音乐窗帧内不应有全局亮 surface 面板色"
+    );
+    // 开换肤子菜单 → 重绘 → 弹层面板色 = 全局亮 surface。
+    let btn = settings_btn_center(&view, wcx);
+    click_at(wcx, btn);
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        frame_has_quad_like(wcx, surface_rgb, panel_alpha),
+        "(y) 取证：换肤子菜单弹层面板应取全局亮 surface（现依赖面被钉住）"
+    );
+    // 关菜单（点外部）→ 帧内恢复无全局 surface 面板色。
+    click_at(wcx, gpui::point(px(600.), px(300.)));
+    wcx.update(|window, app| window.draw(app).clear(app));
+    wcx.run_until_parked();
+    assert!(
+        !frame_has_quad_like(wcx, surface_rgb, panel_alpha),
+        "菜单关闭后音乐窗帧内应不再有全局亮 surface 面板色"
+    );
+}
