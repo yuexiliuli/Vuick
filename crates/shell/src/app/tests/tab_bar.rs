@@ -260,3 +260,92 @@
         );
     }
 
+    /// VS Code 经典选项卡几何（2026-11-24 修订）：激活/非激活统一「全高 32px 单元格」
+    /// （`h(px(32.)).mt(px(0.)).mb(px(0.))`、内容 items_center 居中）→ 内容中心恒 y=16：
+    /// 选中文字不再位移（旧「激活 29+mt3 中心 17.5 vs 非激活 26+my3 中心 16」→ 选中下移
+    /// 1.5px，即 bug 1）；hover/激活底色画在 32px 全高盒上铺满整格（旧底色画在 26/29 盒
+    /// 上、3px 上下 margin 在盒外留空隙，即 bug 2）。顶部 1px 蓝强调线 = 绝对定位子元素
+    /// `tab-accent-{idx}`（贴齐选项卡栏最顶缘 y0，用户指定），非盒 border（避免 border 落
+    /// 在叠加位置）。激活项底缘贴栏底（32 到栏底）→ 以不透明编辑区底色盖断栏底分隔线在
+    /// 选中 x 段的显示（`tab-bar-divider` 存在且 1px 高贴栏底）。
+    /// 判别力：撤掉「全高 32」几何改动，本测试应红——(a) 内容中心位移 1.5px、(b) 盒高≠32。
+    #[gpui::test]
+    async fn active_tab_bottom_aligns_with_tab_bar_bottom(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // (a) bug 1 判别前置：读 tab-0 在「激活态」下的内容中心 y（关闭钮 `.center()`）。
+        let close0_active = cx
+            .debug_bounds("tab-close-0")
+            .expect("激活态下 tab-0 关闭钮应渲染")
+            .center()
+            .y
+            .as_f32();
+        // add_app 预建 tab-0（激活）；再新建 tab-1 → 新 tab 成为激活、tab-0 转非激活。
+        cx.update(|window, cx| app.update(cx, |app, cx| app.new_tab(window, cx)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        let bar_tabs = cx
+            .debug_bounds("tab-bar-tabs")
+            .expect("选项卡滚动容器 tab-bar-tabs 应渲染");
+        let active = cx
+            .debug_bounds("tab-1")
+            .expect("激活选项卡 tab-1 应渲染");
+        let inactive = cx
+            .debug_bounds("tab-0")
+            .expect("非激活选项卡 tab-0 应渲染");
+        // (c) 激活项底缘贴齐选项卡栏底（≤1px；新盒高 32 到栏底仍成立）。
+        assert!(
+            (active.bottom().as_f32() - bar_tabs.bottom().as_f32()).abs() <= 1.0,
+            "激活选项卡底缘应贴齐选项卡栏底：active={active:?} bar_tabs={bar_tabs:?}"
+        );
+        // (b) bug 2 判别：激活/非激活盒高都 == 单元格高（全高 32px、铺满整格，无 3px
+        // 上下空隙）——撤掉「全高 32」该断言红。
+        for (label, tab) in [("激活", &active), ("非激活", &inactive)] {
+            assert!(
+                tab.size.height.as_f32() >= 31.0
+                    && (tab.size.height.as_f32() - bar_tabs.size.height.as_f32()).abs() <= 0.5,
+                "{label}选项卡应铺满整格（全高 32）：tab={tab:?} bar_tabs={bar_tabs:?}"
+            );
+        }
+        // (a) bug 1 判别：切换激活前后同一 tab 的内容中心 y 不变（≤0.5px；旧行为激活
+        // 17.5 vs 非激活 16、差 1.5px 必红）。
+        let close0_inactive = cx
+            .debug_bounds("tab-close-0")
+            .expect("非激活态下 tab-0 关闭钮应渲染")
+            .center()
+            .y
+            .as_f32();
+        assert!(
+            (close0_inactive - close0_active).abs() <= 0.5,
+            "切换激活前后 tab-0 内容中心 y 应不变（防选中文字位移）：active={close0_active} inactive={close0_inactive}"
+        );
+        // 顶部蓝强调线：仅激活项有（绝对定位 1px、贴齐选项卡栏最顶缘 y0），非激活无。
+        let accent = cx
+            .debug_bounds("tab-accent-1")
+            .expect("激活选项卡应有顶部蓝线 tab-accent-1");
+        assert!(
+            accent.size.height.as_f32() <= 1.5
+                && (accent.origin.y.as_f32() - active.origin.y.as_f32()).abs() <= 1.0,
+            "顶线应 1px 高、贴齐激活项顶部（y0）：accent={accent:?} active={active:?}"
+        );
+        assert!(
+            cx.debug_bounds("tab-accent-0").is_none(),
+            "非激活选项卡不应有顶部蓝线"
+        );
+        // 栏底自绘分隔线：1px 高、贴栏底（选中项用不透明底盖断它在选中 x 范围内的部分）。
+        let divider = cx
+            .debug_bounds("tab-bar-divider")
+            .expect("选项卡栏底分隔线应渲染");
+        assert!(
+            divider.size.height.as_f32() <= 1.5
+                && (divider.bottom().as_f32() - bar_tabs.bottom().as_f32()).abs() <= 1.0,
+            "分隔线应 1px 高并贴齐栏底：divider={divider:?}"
+        );
+    }
+

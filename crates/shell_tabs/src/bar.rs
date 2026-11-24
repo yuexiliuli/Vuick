@@ -29,6 +29,7 @@ use gpui::{
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, SharedString,
     StatefulInteractiveElement, Styled, WeakEntity, Window,
 };
+use gpui::prelude::FluentBuilder as _;
 use shell_core::{AppModel, TabDragData, TabDragGhost};
 use shell_widgets::scrollbar::{horizontal_scrollbar, TableScrollState};
 use shell_widgets::TabBoundsRecorder;
@@ -42,8 +43,11 @@ use crate::host::TabsHost;
 struct TabBarColors {
     text_primary: gpui::Hsla,
     text_minor: gpui::Hsla,
-    tab_active_bg: gpui::Hsla,
-    tab_active_border: gpui::Hsla,
+    /// 激活选项卡顶部 1px 强调线（VS Code 经典：仅选中项画顶线；取
+    /// `Theme::global(cx).colors.accent`，随用户自定义强调色）。
+    tab_active_accent: gpui::Hsla,
+    /// 选项卡右缘分隔细线（`ChromeColors::hairline`，紧贴摆时每项右缘 1px）。
+    tab_divider: gpui::Hsla,
     hover_fill: gpui::Hsla,
     /// 拖拽排序「插入指示线」纯白（亮暗同值，`ChromeColors::tab_reorder_line`）。
     reorder_line: gpui::Hsla,
@@ -124,14 +128,9 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         self.chrome(cx).text_minor.into()
     }
 
-    /// 激活选项卡背景。
-    fn tab_active_bg(&self, cx: &App) -> gpui::Hsla {
-        self.chrome(cx).tab_active_bg.into()
-    }
-
-    /// 激活选项卡边框。
-    fn tab_active_border(&self, cx: &App) -> gpui::Hsla {
-        self.chrome(cx).tab_active_border.into()
+    /// 区域分隔发丝线（`ChromeColors::hairline`，与 host `chrome.rs::hairline` 同源）。
+    fn hairline(&self, cx: &App) -> gpui::Hsla {
+        self.chrome(cx).hairline.into()
     }
 
     /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
@@ -140,8 +139,8 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         TabBarColors {
             text_primary: self.text_primary(cx),
             text_minor: self.text_minor(cx),
-            tab_active_bg: self.tab_active_bg(cx),
-            tab_active_border: self.tab_active_border(cx),
+            tab_active_accent: ui::theme::Theme::global(cx).colors.accent.into(),
+            tab_divider: self.hairline(cx),
             hover_fill: c.hover_fill.into(),
             reorder_line: c.tab_reorder_line.into(),
         }
@@ -158,6 +157,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         path_hint: Option<String>,
         idx: usize,
         is_active: bool,
+        is_last: bool,
         reorder_line: Option<ReorderSide>,
         bounds_cell: Rc<Cell<Bounds<Pixels>>>,
         colors: &TabBarColors,
@@ -269,8 +269,9 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         let mut el = div()
             .id(SharedString::from(format!("tab-{idx}")))
             .debug_selector(move || format!("tab-{idx}"))
-            .h(px(26.))
-            .my(px(3.))
+            .h(px(32.))
+            .mt(px(0.))
+            .mb(px(0.))
             .px_2()
             .flex()
             .items_center()
@@ -279,9 +280,34 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
             .cursor(CursorStyle::PointingHand)
             .text_size(px(12.))
             .text_color(colors.text_primary)
-            // 几何硬约束（2026-11-10）：[脏点, 名, 关闭钮] 包进内层 flex_row + gap_1，
-            // 外层去掉 gap_1——tooltip_layer 空 div 作外层直子零宽度，tab 的 border-box
-            // 与改动前逐像素一致；浮层锚在 tab 下方水平居中（host_w=内容宽近似）。
+            // 选项卡间分隔细线：每项右缘 1px 发丝线（末尾项不画，避免空区孤立竖线）；
+            // 紧贴摆（`#tab-bar-tabs` 已去 gap_1），线与相邻项左缘相接。
+            .when(!is_last, |this| {
+                this.border_r_1().border_color(colors.tab_divider)
+            });
+        // 全高 32px 单元格（激活/非激活统一）：内容 items_center 垂直居中 → 内容中心恒
+        // y=16、选中文字不位移（旧「激活 29+mt3 中心 17.5 vs 非激活 26+my3 中心 16」使选中
+        // 时文字下移 1.5px，即 bug 1）；hover/激活底色画在 32px 全高盒上、铺满整格（旧底色
+        // 画在 26/29 盒上、3px 上下 margin 在盒外留空隙，即 bug 2）。顶部 1px 蓝强调线 =
+        // 激活分支的绝对定位子元素（见下），非盒 border。
+        el = if is_active {
+            el.child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left_0()
+                    .right_0()
+                    .h(px(1.))
+                    .bg(colors.tab_active_accent)
+                    .debug_selector(move || format!("tab-accent-{idx}")),
+            )
+        } else {
+            el
+        };
+        // 几何硬约束（2026-11-10）：[脏点, 名, 关闭钮] 包进内层 flex_row + gap_1，
+        // 外层去掉 gap_1——tooltip_layer 空 div 作外层直子零宽度，tab 的 border-box
+        // 与改动前逐像素一致；浮层锚在 tab 下方水平居中（host_w=内容宽近似）。
+        let mut el = el
             .child(
                 div()
                     .flex()
@@ -300,24 +326,12 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 &path_hint,
                 has_path && tip_on,
                 host_w,
-                26.0,
+                32.0,
                 ui::tooltip::TooltipPlacement::Below,
                 ui::tooltip::TooltipTone::Compact,
                 anchor,
                 cx,
             ));
-        // 激活项 = VS Code 卡片式：26px 圆角白卡浮在灰带上（浅色下）；
-        // 非激活项透明底 + hover 填充（背景由底部弹簧统一淡入，P2-10）——非激活项同样加
-        // `rounded_md()`（**不加** `border_1/border_color`，边框仅激活卡片有，非激活透明底
-        // 有边框会变方形框），保证 hover 高亮为**圆角矩形**而非尖角方矩形；border-radius
-        // 不改 border-box 尺寸，既有几何测试不受影响。
-        el = if is_active {
-            el.rounded_md()
-                .border_1()
-                .border_color(colors.tab_active_border)
-        } else {
-            el.rounded_md()
-        };
         // hover 状态跨帧记录，驱动关闭 × 悬停显现与行背景淡入；同时驱动路径 tooltip 出没。
         el = el.on_hover({
             let st = tab_hover.clone();
@@ -368,10 +382,12 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
         // 拖拽开始即把抓取偏移写共享模型、并反调宿主预建窗外幽灵窗（`prime_drag_ghost`）。
         let tab_weak = cx.weak_entity();
         let host_for_drag = host.clone();
-        // P2-10：背景弹簧——激活=白卡轻淡入、非激活=hover 填充淡入（同一曲线）；
-        // 激活底色 / hover 底色自带 alpha，`opacity` 乘性，v=1 即原色，语义不变。
+        // P2-10：背景弹簧——激活=编辑区底（`ui::shell::body_card_face`，与正文卡同源
+        // 一体）、非激活=hover 填充淡入（同一曲线）；底色自带 alpha，`opacity` 乘性，
+        // v=1 即原色，语义不变。激活项以不透明编辑区底色在自身 x 范围盖住栏底分隔线
+        // → 线只在非选中项/间隙下连续、到选中项断开。
         let card = if is_active {
-            colors.tab_active_bg
+            ui::shell::body_card_face(cx)
         } else {
             colors.hover_fill
         };
@@ -566,7 +582,8 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
 
     /// 选项卡栏：横跨右列顶部的选项卡行，左侧滚动区 + （按需）眼睛按钮；
     /// 右键整条栏弹「新建文件 / 打开文件」上下文菜单（取代已移除的「+」按钮）。
-    /// 底边绘一条右列宽发丝线（`bar_border`），分隔下方编辑区正文。
+    /// 栏底自绘一条右列宽发丝线（首个子元素，`hairline`）分隔下方编辑区正文：
+    /// 激活选项卡以其不透明编辑区底色盖住该线、下缘贴齐栏底（VS Code 经典）。
     /// 零选项卡（`tabs.is_empty()`，即欢迎页呈现时）提前返回空元素——选项卡栏
     /// 在 flex 列中占零高度，欢迎页从标题栏下直接铺到状态栏。
     /// `tab_bounds` 以 `&mut` 传入：每帧重建边界槽（排序命中测试读上一帧值；记录器在
@@ -643,6 +660,7 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 path_hint,
                 i,
                 i == active,
+                i + 1 == tabs_len,
                 line,
                 tab_bounds[i].clone(),
                 &colors,
@@ -682,10 +700,22 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                 MouseButton::Right,
                 cx.listener(Self::on_tab_bar_right_click),
             )
-            // 选项卡栏↔编辑区的发丝线由下方编辑区顶边绘制（见 render_body_card，
-            // 此处不画底边框，避免被后绘制的编辑区面板盖住）。
+            // 选项卡栏↔编辑区分隔：发丝线改由**本栏**自绘（首个子元素垫底）——迁移前由
+            // 下方编辑区卡顶边绘制（render_body_card 的 border_t_1），后绘制的卡会把任何
+            // 伸下去的激活 tab 底缘盖回来；迁移后线在选中项 x 范围内被激活项不透明底色
+            // 盖断、仅非选中项/间隙下连续（选中项底缘贴栏底，见 render_tab_bar_item）。
             // 选项卡横向滚动区：占满剩余宽度；标签不收缩，过多即横向溢出可滚轮/拖拽滚动。
             // 横向滚动条浮在标签底部（见 hscroll_overlay），不改变整体高度。
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(1.))
+                    .bg(self.hairline(cx))
+                    .debug_selector(|| "tab-bar-divider".into()),
+            )
             .child(
                 div()
                     .id("tab-bar-scroll")
@@ -702,7 +732,6 @@ impl<H: TabsHost + TabDragHost> TabBar<H> {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_1()
                             .overflow_x_scroll()
                             .track_scroll(&hscroll.handle)
                             // 滚动时点亮横向滚动条（自动隐藏计时由此重启）

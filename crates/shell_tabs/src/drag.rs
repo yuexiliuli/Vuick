@@ -38,8 +38,9 @@ pub type TabBoundsCell = Rc<Cell<Bounds<Pixels>>>;
 
 /// 拖拽预告（半透明选项卡）尺寸的**兜底估算**（仅真实 laid-out 尺寸尚未记录的首帧用）：
 /// 宽 = `shape_line` 文本宽 + px_2 两侧(16) + 2×gap(8) + 关闭钮(18) + 边框(4) ≈ +46；
-/// 高 = 选项卡 26。正常情况下 [`crate::bar::TabBar`] 的 `TabBoundsRecorder` + 尺寸记录器
-/// 已把真实 laid-out 尺寸写入，不会走这里。
+/// 高 = 选项卡全高 32（激活/非激活统一 `h(px(32.)).mt0.mb0`，`render_tab_bar_item`；
+/// 首帧估算误差次帧即被真实 laid-out 尺寸覆盖）。正常情况下 [`crate::bar::TabBar`] 的
+/// `TabBoundsRecorder` + 尺寸记录器已把真实 laid-out 尺寸写入，不会走这里。
 pub fn tab_preview_size(name: &str, dirty: bool, window: &Window) -> Size<Pixels> {
     let text = if dirty {
         format!("● {name}")
@@ -50,7 +51,7 @@ pub fn tab_preview_size(name: &str, dirty: bool, window: &Window) -> Size<Pixels
         .text_system()
         .shape_line(SharedString::from(text), px(12.), &[], None);
     let text_w = line.width();
-    gpui::size((text_w + px(46.)).max(px(64.)), px(26.))
+    gpui::size((text_w + px(46.)).max(px(64.)), px(32.))
 }
 
 /// 窗内 gpui 拖拽 picture 是否**将要**被窗口边缘遮断（含 [`DRAG_EDGE_CLIP_MARGIN`] 余量）？

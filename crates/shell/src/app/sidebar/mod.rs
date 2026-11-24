@@ -27,7 +27,6 @@
 
 use super::file_tree_prompt::FileTreePromptKind;
 use super::*;
-use gpui::prelude::FluentBuilder;
 use gpui::Entity;
 use shell_sidebar::SidebarHost;
 use ui::input::InputState;
@@ -357,15 +356,14 @@ impl EditorApp {
     }
 
     /// 正文区无缝方块：右缘贴窗直角、其它三缘与侧栏/选项卡栏/状态栏零间距直连，
-    /// 无圆角、无边框（侧栏右缘发丝线、标题栏/选项卡栏底边发丝线与状态栏顶边负责分隔）。
-    /// 卡面用正文底色（`panel_bg`，与编辑器/预览无缝）。
+    /// 无圆角、无边框（侧栏右缘发丝线、选项卡栏底边自绘发丝线与状态栏顶边负责分隔）。
+    /// 卡面用正文底色（`body_card_face`，与编辑器/预览无缝）。
     fn render_body_card(
         &mut self,
         body: gpui::AnyElement,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let has_tabs = !self.model.borrow().tabs.is_empty();
         div()
             .id("app-main-card")
             .debug_selector(|| "app-main-card".into())
@@ -380,12 +378,10 @@ impl EditorApp {
             .mr(px(0.))
             .mt(px(0.))
             .mb(px(0.))
-            // 顶边 1px 发丝线 = 选项卡栏↔编辑区之分隔（由后绘制的编辑区绘制，
-            // 保证不受上层选项卡栏遮挡）；其余三边由侧栏右缘/状态栏顶边承担，不重复。
-            // 零选项卡（欢迎页）时省略顶边发丝线，由标题栏底边发丝线作唯一分隔，
-            // 防「标题栏底边 + 卡片顶边」两条 1px 发丝线上下相贴成双线。
-            .when(has_tabs, |this| this.border_t_1())
-            .border_color(self.hairline(cx))
+            // 选项卡栏↔编辑区分隔发丝线已迁至 `shell_tabs::bar::render_tab_bar` 栏内自绘
+            // （首个子元素 `tab-bar-divider`，2026-11-24）：此处不再画卡顶边——若仍由后
+            // 绘制的卡画，会盖住伸进编辑区底缘的激活选项卡，破坏「选中项与编辑区一体」。
+            // 零/有 tab 都不再画卡顶线。
             .bg(ui::shell::body_card_face(cx))
             .overflow_hidden()
             .child(body)

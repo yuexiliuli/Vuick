@@ -831,7 +831,7 @@ impl Render for TabDragGhost {
         let c = theme.chrome;
         let s = self.size.get();
         let w = if s.width > px(0.) { s.width } else { px(120.) };
-        let h = if s.height > px(0.) { s.height } else { px(26.) };
+        let h = if s.height > px(0.) { s.height } else { px(32.) };
         let mut base = div()
             .id("tab-drag-ghost")
             .debug_selector(|| "tab-drag-ghost".into())
@@ -841,13 +841,26 @@ impl Render for TabDragGhost {
             .items_center()
             .gap_1()
             .px_2()
-            .rounded_md()
-            .bg(c.tab_active_bg.opacity(0.85));
-        // 仅在窗内 picture 保留 1px 描边（与真实激活选项卡观感一致）；窗外幽灵窗不描边。
+            .relative()
+            // 经典 VS Code 矩形选项卡外观（与真实激活项一致）：去圆角、底色 = 编辑区
+            // 背景色（半透明表达「正在拖动」）、顶边 1px 强调蓝线（对位 tab-accent）。
+            .bg(ui::shell::body_card_face(cx).opacity(0.85))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left_0()
+                    .right_0()
+                    .h(px(1.))
+                    .bg(theme.colors.accent.opacity(0.9)),
+            );
+        // 仅窗内 picture 保留 1px 描边（与真实激活选项卡观感一致）：右缘发丝线（对位
+        // border_r 选项卡分隔线）；窗外幽灵窗不描边（悬于桌面时该描边被单独呈现为
+        // 「四根线条围住选项卡」）。
         if !self.ghost {
             base = base
-                .border_1()
-                .border_color(c.tab_active_border.opacity(0.7));
+                .border_r_1()
+                .border_color(c.hairline.opacity(0.7));
         }
         base.text_size(px(12.))
             .text_color(c.text_primary.opacity(0.92))
