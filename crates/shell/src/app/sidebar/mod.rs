@@ -27,6 +27,7 @@
 
 use super::file_tree_prompt::FileTreePromptKind;
 use super::*;
+use gpui::prelude::FluentBuilder;
 use gpui::Entity;
 use shell_sidebar::SidebarHost;
 use ui::input::InputState;
@@ -364,6 +365,7 @@ impl EditorApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let has_tabs = !self.model.borrow().tabs.is_empty();
         div()
             .id("app-main-card")
             .debug_selector(|| "app-main-card".into())
@@ -380,7 +382,9 @@ impl EditorApp {
             .mb(px(0.))
             // 顶边 1px 发丝线 = 选项卡栏↔编辑区之分隔（由后绘制的编辑区绘制，
             // 保证不受上层选项卡栏遮挡）；其余三边由侧栏右缘/状态栏顶边承担，不重复。
-            .border_t_1()
+            // 零选项卡（欢迎页）时省略顶边发丝线，由标题栏底边发丝线作唯一分隔，
+            // 防「标题栏底边 + 卡片顶边」两条 1px 发丝线上下相贴成双线。
+            .when(has_tabs, |this| this.border_t_1())
             .border_color(self.hairline(cx))
             .bg(ui::shell::body_card_face(cx))
             .overflow_hidden()

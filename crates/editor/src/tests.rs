@@ -6,3 +6,4 @@ include!("tests/view.rs");
 include!("tests/find.rs");
 include!("tests/goto.rs");
 include!("tests/tab.rs");
+include!("tests/focus_caret.rs");

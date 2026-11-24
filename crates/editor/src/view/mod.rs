@@ -785,6 +785,13 @@ impl CodeEditor {
         self.buffer.unit_column(self.selection.head().min(self.buffer.len()))
     }
 
+    /// 测试探针（`cfg(test)`）：当前光标焦点态 `caret.focused`（失焦 = 光标停闪）。
+    /// 仅供 `tests/focus_caret.rs` 红测断言「find 输入框持焦时编辑区应停闪」使用。
+    #[cfg(test)]
+    pub(crate) fn test_caret_focused(&self) -> bool {
+        self.caret.focused
+    }
+
     /// 测试用：逻辑行 `row` 在当前横滚/可视宽下走**生产同一条**超长行窗口化路径
     /// （`render::long_line_window`，真实字体 `layout_width`）的截取结果
     /// `(行内字节区间, 左偏移 px)`；短行/未超窗/空行 → `None`（整行直送）。

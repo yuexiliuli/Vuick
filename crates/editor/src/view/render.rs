@@ -576,12 +576,18 @@ impl CodeEditor {
         }
         // 补同步：应用启动时 window.focus() 发生在 on_focus 注册之前 → 事件丢失，
         // `focused` 永远是 false → 光标不显示但也无法输入。这里按当前焦点态对齐。
+        // 双向对称（镜像 wysiwyg/core.rs `sync_focus`）：聚焦→开始闪；失焦（如
+        // find/goto 输入框持焦使编辑区不再是焦点叶子）→ `on_blur` 置 false 停闪。
+        // 两分支各只在 true↔false 转变帧触发一次（此后不再满足条件），不逐帧 notify。
         if self.focus_handle.is_focused(window) && !self.caret.focused {
             self.caret.focused = true;
             self.caret.kick();
             if !self.caret.blink_running {
                 self.start_blink(cx);
             }
+            cx.notify();
+        } else if !self.focus_handle.is_focused(window) && self.caret.focused {
+            self.on_blur(window, cx);
             cx.notify();
         }
 
