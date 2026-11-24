@@ -246,7 +246,12 @@ impl EditorApp {
             command!("文件", SAVE_AS, |this, window, cx| {
                 this.save_as(window, cx)
             }),
-            command!("文件", QUIT, |_this, _window, cx| cx.quit()),
+            command!("文件", QUIT, |_this, _window, cx| {
+                // 显式退出（命令面板）不走 on_window_should_close → 退出前清托盘图标，
+                // 防幽灵图标残留（同 init.rs on_window_should_close / menu.rs QUIT）。
+                tray::shutdown();
+                cx.quit()
+            }),
             // 编辑
             command!("编辑", UNDO, |this, window, cx| {
                 Self::dispatch_editor_action(this, window, cx, Box::new(Undo))

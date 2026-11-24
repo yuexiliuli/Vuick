@@ -129,7 +129,12 @@ impl EditorApp {
             QUIT.menu_label,
             QUIT.shortcut,
             weak,
-            |_, _window, cx| cx.quit(),
+            |_, _window, cx| {
+                // 显式退出（Ctrl+Q / 菜单）不走 on_window_should_close（本平台 PostQuitMessage
+                // 直出）→ 退出前先清托盘图标，防幽灵图标残留（同 init.rs on_window_should_close）。
+                tray::shutdown();
+                cx.quit()
+            },
         ))
     }
 

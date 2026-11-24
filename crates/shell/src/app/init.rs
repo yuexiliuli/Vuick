@@ -405,6 +405,10 @@ impl EditorApp {
                             tray::hide_main_window();
                             false
                         } else {
+                            // 真正关闭主窗口 = 应用即将退出 → 先移除托盘图标（NIM_DELETE），
+                            // 杜绝「幽灵图标」残留：本平台最后窗口退出不走 on_app_quit（K9），
+                            // 若 NIM_DELETE 不挂在此，每次启动留下的图标都不清、鼠标划过才消。
+                            tray::shutdown();
                             true
                         }
                     });

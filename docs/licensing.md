@@ -16,6 +16,7 @@
 - **zstd**（PDF 载荷压缩）：BSD-3-Clause / MIT。
 - **pdfium**（`pdfium-render` —— MIT OR Apache-2.0；内嵌 PDFium 预编译库 —— **BSD-3-Clause + Apache-2.0**，含 FreeType/ICU 等内嵌第三方各自许可）：PDF 栅格化。许可原文见 `third_party/pdfium/`。
 - **gpui 及 zed 子集**（UI 框架，`vendor/zed`）：Apache-2.0（zed 仓库 gpui 等 crates 子系统；仅 vendor Windows 子集闭包，rev 93d7456）。Apache-2.0 宽松许可，可并入 GPL-3.0 程序。
+- **SimdCodecs**（`crates/kimg*` 图像编解码内核的重写来源）：**MIT**（C# `sdcb/SimdCodecs`，GitHub: `sdcb/SimdCodecs`）。`kimg` 为其纯 Rust 重写（PNG/JPEG/WebP/GIF/BMP/ICO/PNM/TIFF 解码）；夹具 golden 数据许可记录见 `crates/kimg_webp/tests/fixtures/webp/ATTRIBUTION.md`。
 
 ## 专利口径（非法律意见）
 

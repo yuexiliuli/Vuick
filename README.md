@@ -61,7 +61,7 @@
 
 ## 🚀 获取与安装
 
-> 目前未经官网分发，请从源码构建；已打包产物可用 `scripts/package.ps1` 生成。
+> 已发布版本可直接从 [GitHub Releases](https://github.com/yuexiliuli/Vuick/releases/latest) 下载（`vuick-win64` 打包产物随包内置 FFmpeg / pdfium，免配置即可运行）；从源码构建 / 自行打包见下：
 
 ```bash
 # 开发运行（需先配 FFmpeg 环境）
@@ -82,9 +82,17 @@ cargo build --workspace --no-default-features --exclude media_ffmpeg
 
 </details>
 
-## 🧩 技术栈
+## 🧩 主要技术栈
 
-Rust（edition 2024）· GPUI（Zed 仓库 vendored fork，`vendor/zed`，原生窗口，无 webview）· ropey · syntect · pdfium-render · FFmpeg 9.0 / cpal · kimg（PNG/JPEG/WebP/GIF/BMP/ICO/PNM/TIFF 解码）· encoding_rs
+| 技术 | 用途 | GitHub |
+| --- | --- | --- |
+| Rust (1.96.0) | 全仓构建语言 | [rust-lang/rust](https://github.com/rust-lang/rust) |
+| GPUI | 原生 UI / 渲染 / 窗口 | [zed-industries/zed](https://github.com/zed-industries/zed) |
+| ropey | UTF-8 / UTF-16 缓冲区与插入型文本 | [cessen/ropey](https://github.com/cessen/ropey) |
+| syntect | 代码语法高亮 | [trishume/syntect](https://github.com/trishume/syntect) |
+| pdfium-render | PDF 栅格化渲染 | [ajrcarey/pdfium-render](https://github.com/ajrcarey/pdfium-render) |
+| FFmpeg | 视频解码与重采样 | [FFmpeg/FFmpeg](https://github.com/FFmpeg/FFmpeg) |
+| kimg（图像解码） | 纯 Rust 图像编解码核心（[SimdCodecs](https://github.com/sdcb/SimdCodecs) 的 Rust 重写版） | [sdcb/SimdCodecs](https://github.com/sdcb/SimdCodecs) |
 
 ## 📚 文档
 
@@ -102,4 +110,4 @@ Rust（edition 2024）· GPUI（Zed 仓库 vendored fork，`vendor/zed`，原生
 
 ## 📄 许可
 
-GPL-3.0-or-later（见 `LICENSE-GPL`）；第三方组件（内置 FFmpeg 的 LGPL 运行时动态加载、pdfium、zorite 衍生识别层等）合规说明见 [许可证与合规](docs/licensing.md) 与发行包内 `THIRD_PARTY_NOTICES.md`。
+GPL-3.0-or-later（见 `LICENSE-GPL`）；第三方组件合规说明见 [许可证与合规](docs/licensing.md) 与发行包内 `THIRD_PARTY_NOTICES.md`。

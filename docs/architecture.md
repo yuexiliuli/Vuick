@@ -6,7 +6,7 @@
 
 | 类别 | 选型 |
 | --- | --- |
-| 语言 / UI | Rust · GPUI `0.2.2`（无 webview，原生窗口） |
+| 语言 / UI | Rust · GPUI  |
 | 文件对话框 | `rfd`（系统原生打开 / 保存对话框） |
 | 文本 / 编辑 | `ropey`（缓冲区）· `regex` · `memchr` · `unicode-segmentation` · `unicode-bidi` · `rustc-hash` |
 | 语法高亮 | `syntect`（解析）→ 自研 `GitHubTheme` / `SemanticStyleResolver` |
@@ -15,10 +15,17 @@
 | 编码 | `encoding_rs`（GBK/GB18030/UTF-16 等非 UTF-8 解码；保存按各选项卡源编码回写） |
 | PDF | `pdfium-render` |
 | EPUB / 压缩 | `roxmltree` · `zip` |
-| 图像 | 自研 `kimg`（纯 Rust：PNG/JPEG/WebP/GIF/BMP/ICO/PNM/TIFF 解码，PNG/GIF 编码）|
+| 图像 | `kimg`（纯 Rust 图像编解码核心：PNG/JPEG/WebP/GIF/BMP/ICO/PNM/TIFF 解码，PNG/GIF 编码；[sdcb/SimdCodecs](https://github.com/sdcb/SimdCodecs) 的 Rust 重写版）|
 | 视频 | `ffmpeg-next`（FFmpeg 9.0 解码 / 重采样）· `cpal`（音频输出） |
 | 序列化 | `serde` · `serde_json` |
 | 测试 | GPUI `test-support`（`cargo test`；shell 全量 ~80s、271 passed，测试默认隔离落 `%TEMP%`） |
+
+### 外部二进制依赖下载
+
+| 依赖 | 用途 | 下载地址 |
+| --- | --- | --- |
+| PDFium | PDF 栅格化（`resources/pdfium/pdfium-154.0.8035.0.dll`，`crates/pdf/build.rs` 内嵌） | [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)（发布包取 `pdfium-win-x64.tgz`） |
+| FFmpeg 9.0.2（LGPL 瘦化构建） | 视频解码 / 重采样（`media_ffmpeg.dll`，运行时动态加载） | 源码（跨平台通用编译入口）：<https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz>；Git 镜像 [github.com/FFmpeg/FFmpeg](https://github.com/FFmpeg/FFmpeg)（分支 `n9.0.2`）—— Windows 开发期直接用预编译共享版：<https://www.gyan.dev/ffmpeg/builds/>（`ffmpeg-release-full-shared`，LGPL）或 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)（`win64-gpl-shared`）；正式分发用本仓 `scripts/build-slim-ffmpeg*.sh` 自建瘦共享包 |
 
 ## UI 组件库
 

@@ -61,7 +61,7 @@
 
 ## 🚀 Getting It & Installing
 
-> Not yet distributed from an official website — build from source; packaged artifacts can be produced with `scripts/package.ps1`.
+> Prebuilt releases are available on [GitHub Releases](https://github.com/yuexiliuli/Vuick/releases/latest) (the `vuick-win64` package bundles FFmpeg / pdfium — ready to run). To build or package from source, see below:
 
 ```bash
 # Dev run (set up the FFmpeg environment first)
@@ -84,7 +84,15 @@ cargo build --workspace --no-default-features --exclude media_ffmpeg
 
 ## 🧩 Tech Stack
 
-Rust (edition 2024) · GPUI (vendored fork of the Zed repository, `vendor/zed`, native window, no webview) · ropey · syntect · pdfium-render · FFmpeg 9.0 / cpal · kimg (PNG/JPEG/WebP/GIF/BMP/ICO/PNM/TIFF decoding) · encoding_rs
+| Tech | Purpose | GitHub |
+| --- | --- | --- |
+| Rust (1.96.0) | The build language for the whole repo | [rust-lang/rust](https://github.com/rust-lang/rust) |
+| GPUI | Native UI / rendering / windows | [zed-industries/zed](https://github.com/zed-industries/zed) |
+| ropey | UTF-8 / UTF-16 buffers and insertion-based text | [cessen/ropey](https://github.com/cessen/ropey) |
+| syntect | Code syntax highlighting | [trishume/syntect](https://github.com/trishume/syntect) |
+| pdfium-render | PDF rasterization | [ajrcarey/pdfium-render](https://github.com/ajrcarey/pdfium-render) |
+| FFmpeg | Video decoding & resampling | [FFmpeg/FFmpeg](https://github.com/FFmpeg/FFmpeg) |
+| kimg (image decoding) | Pure-Rust image codec core (a Rust rewrite of [SimdCodecs](https://github.com/sdcb/SimdCodecs)) | [sdcb/SimdCodecs](https://github.com/sdcb/SimdCodecs) |
 
 ## 📚 Documentation
 

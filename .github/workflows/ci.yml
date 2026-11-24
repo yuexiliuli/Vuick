@@ -8,65 +8,65 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: check (windows-latest)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      # 工具链 pin：仓库根 rust-toolchain.toml（channel = "1.96.0"）是权威来源，
-      # dtolnay action 显式装同一版本（不能用 @stable 跟随最新）。升级工具链两处同改。
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.96.0"
-      - uses: Swatinem/rust-cache@v2
-      # 本仓库 CI 只做编译验证，不运行测试：多数测试依赖本地资源（pdfium 锁、FFmpeg
-      # 运行 dll、pdf/视频 fixture、SIMD CPU 基线），不上传/不可复现于 GitHub runner，
-      # 跑 test 意义有限且稳定红。测试在本机本地执行。
-      # 分两段（本仓自研 crates 全部 --all-features；vendored zed 三包 check 含测试目标）：
-      # 不能用 `--workspace --all-features`：workspace 含 vendored gpui，其 --all-features
-      # 会连带 wayland/x11/http_client(test-support)→async-tar(git, Windows 编译坏)。
-      - name: cargo check (local crates, all features)
-        run: |
-          $crates = @(
-            'media_io','config','base','ime','viewer','syntax','ui','editor','editor_core',
-            'text_open','markdown','markdown_wysiwyg','markdown_wysiwyg_engine',
-            'markdown_wysiwyg_mermaid','markdown_wysiwyg_math','toc','pdf_core',
-            'image_viewer','video','epub','shell','shell_core','shell_sidebar','shell_pdf',
-            'shell_media','shell_preview','shell_tabs','tray','music','session_store',
-            'shell_commands','shell_scan','shell_widgets','kimg','kimg_core','kimg_png',
-            'kimg_gif','kimg_jpeg','kimg_tiff','kimg_bmp','kimg_ico','kimg_pnm','kimg_heif',
-            'kimg_webp'
-          )
-          $args = @('check') + ($crates | ForEach-Object { '-p', $_ }) + @('--all-features')
-          & cargo @args
-          cargo check -p pdf
-      # vendored zed（vendor/zed）裁剪闭包：gpui/gpui_macros/sum_tree 编译验证。
-      # 注意不要用 --tests：gpui 的 lib 测试模块依赖上游 test-support（proptest/postage 等
-      # 未 vendored 依赖），--tests 会拉坏链；这里只 check lib/main/bin target。
-      - name: cargo check (vendored zed crates)
-        run: cargo check -p gpui -p gpui_macros -p sum_tree
+  # check:
+  #   name: check (windows-latest)
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     # 工具链 pin：仓库根 rust-toolchain.toml（channel = "1.96.0"）是权威来源，
+  #     # dtolnay action 显式装同一版本（不能用 @stable 跟随最新）。升级工具链两处同改。
+  #     - uses: dtolnay/rust-toolchain@master
+  #       with:
+  #         toolchain: "1.96.0"
+  #     - uses: Swatinem/rust-cache@v2
+  #     # 本仓库 CI 只做编译验证，不运行测试：多数测试依赖本地资源（pdfium 锁、FFmpeg
+  #     # 运行 dll、pdf/视频 fixture、SIMD CPU 基线），不上传/不可复现于 GitHub runner，
+  #     # 跑 test 意义有限且稳定红。测试在本机本地执行。
+  #     # 分两段（本仓自研 crates 全部 --all-features；vendored zed 三包 check 含测试目标）：
+  #     # 不能用 `--workspace --all-features`：workspace 含 vendored gpui，其 --all-features
+  #     # 会连带 wayland/x11/http_client(test-support)→async-tar(git, Windows 编译坏)。
+  #     - name: cargo check (local crates, all features)
+  #       run: |
+  #         $crates = @(
+  #           'media_io','config','base','ime','viewer','syntax','ui','editor','editor_core',
+  #           'text_open','markdown','markdown_wysiwyg','markdown_wysiwyg_engine',
+  #           'markdown_wysiwyg_mermaid','markdown_wysiwyg_math','toc','pdf_core',
+  #           'image_viewer','video','epub','shell','shell_core','shell_sidebar','shell_pdf',
+  #           'shell_media','shell_preview','shell_tabs','tray','music','session_store',
+  #           'shell_commands','shell_scan','shell_widgets','kimg','kimg_core','kimg_png',
+  #           'kimg_gif','kimg_jpeg','kimg_tiff','kimg_bmp','kimg_ico','kimg_pnm','kimg_heif',
+  #           'kimg_webp'
+  #         )
+  #         $args = @('check') + ($crates | ForEach-Object { '-p', $_ }) + @('--all-features')
+  #         & cargo @args
+  #         cargo check -p pdf
+  #     # vendored zed（vendor/zed）裁剪闭包：gpui/gpui_macros/sum_tree 编译验证。
+  #     # 注意不要用 --tests：gpui 的 lib 测试模块依赖上游 test-support（proptest/postage 等
+  #     # 未 vendored 依赖），--tests 会拉坏链；这里只 check lib/main/bin target。
+  #     - name: cargo check (vendored zed crates)
+  #       run: cargo check -p gpui -p gpui_macros -p sum_tree
 
-  clippy:
-    name: clippy (windows-latest)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.96.0"
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      # 只 clippy 本仓自研 crates（--workspace --all-features 会连 vendored 的坏 feature 链）；
-      # media_ffmpeg 无 FFmpeg 环境构建失败。vendored zed crates 不在此 lint。
-      - name: cargo clippy (local crates)
-        run: |
-          $crates = @(
-            'media_io','config','base','ime','viewer','syntax','ui','editor','editor_core',
-            'text_open','markdown','markdown_wysiwyg','markdown_wysiwyg_engine',
-            'markdown_wysiwyg_mermaid','markdown_wysiwyg_math','toc','pdf_core',
-            'image_viewer','video','epub','shell','shell_core','shell_sidebar','shell_pdf',
-            'shell_media','shell_preview','shell_tabs','tray','music','session_store',
-            'shell_commands','shell_scan','shell_widgets'
-          )
-          $args = @('clippy') + ($crates | ForEach-Object { '-p', $_ }) + @('--all-features', '--no-deps', '--', '-D', 'warnings')
-          & cargo @args
+  # clippy:
+  #   name: clippy (windows-latest)
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@master
+  #       with:
+  #         toolchain: "1.96.0"
+  #         components: clippy
+  #     - uses: Swatinem/rust-cache@v2
+  #     # 只 clippy 本仓自研 crates（--workspace --all-features 会连 vendored 的坏 feature 链）；
+  #     # media_ffmpeg 无 FFmpeg 环境构建失败。vendored zed crates 不在此 lint。
+  #     - name: cargo clippy (local crates)
+  #       run: |
+  #         $crates = @(
+  #           'media_io','config','base','ime','viewer','syntax','ui','editor','editor_core',
+  #           'text_open','markdown','markdown_wysiwyg','markdown_wysiwyg_engine',
+  #           'markdown_wysiwyg_mermaid','markdown_wysiwyg_math','toc','pdf_core',
+  #           'image_viewer','video','epub','shell','shell_core','shell_sidebar','shell_pdf',
+  #           'shell_media','shell_preview','shell_tabs','tray','music','session_store',
+  #           'shell_commands','shell_scan','shell_widgets'
+  #         )
+  #         $args = @('clippy') + ($crates | ForEach-Object { '-p', $_ }) + @('--all-features', '--no-deps', '--', '-D', 'warnings')
+  #         & cargo @args

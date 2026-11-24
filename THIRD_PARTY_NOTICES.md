@@ -46,9 +46,17 @@
   （`LICENSE`= 打包方 bblanchon 的 MIT；`licenses/pdfium.txt` = PDFium BSD-3 + Apache-2.0；
   `licenses/*` = 各内嵌第三方）。
 
+## SimdCodecs（`crates/kimg*` 图像编解码内核的重写来源）—— MIT
+
+- **形态**：`kimg`（crates/kimg* 家族：PNG/JPEG/WebP/GIF/BMP/ICO/PNM/TIFF 解码）为
+  [sdcb/SimdCodecs](https://github.com/sdcb/SimdCodecs)（C#，MIT）的**纯 Rust 重写版**；
+  Rust 实现经独立 SIMD 内核重构，非 C# 源码直译/逐字节复制。
+- **义务履行**：MIT 宽松许可（保留上游版权与许可文本即可）；夹具 golden 数据来源与
+  许可记录见 `crates/kimg_webp/tests/fixtures/webp/ATTRIBUTION.md`。
+
 ## 其余
 
-- 所有未在此列出的 crates / 代码均为本仓库自研，随本体整体以 GPL-3.0-or-later 授权（Apache-2.0 声明仅存于部分自研模块历史注释，不作为分发许可）。
+- 所有未在此列出的 crates / 代码均为本仓库独立编写，随本体整体以 GPL-3.0-or-later 授权（Apache-2.0 声明仅存于部分仓库内模块的历史注释，不作为分发许可）。
 
 ---
 
