@@ -264,6 +264,49 @@
         assert_eq!(search_page_text(&text, &ndl("abABcx")), Vec::<(usize, usize)>::new());
     }
 
+    /// 检索页文本缓存守门：同 worker 同 doc 同查询**连续两次**全文档检索，第二次完全复用
+    /// worker 侧页文本缓存（`extract_page_text` 计数第二次 delta == 0）。判别式：撤掉缓存
+    /// 回到「每查询每页各抽一次」（旧行为）→ 第二次 delta == 页数 > 0 → 红。
+    #[test]
+    fn search_twice_reuses_cached_page_text() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+
+        // 大概率无命中的乱序 needle → 检索扫完整文档、不提前截断（两次扫描页集合一致）
+        let needle = "qzwxecrvu7y6t5r4zz";
+        let before = super::extract_page_text_calls();
+
+        let rx1 = worker.search(doc_id, needle.to_string());
+        let res1 = rx1
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到首次检索结果")
+            .expect("首次检索应成功");
+        let after_first = super::extract_page_text_calls();
+        assert!(
+            after_first > before,
+            "首次检索应实际抽取页文本（delta>0）：before={before} after={after_first}"
+        );
+
+        let rx2 = worker.search(doc_id, needle.to_string());
+        let res2 = rx2
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到第二次检索结果")
+            .expect("第二次检索应成功");
+        let after_second = super::extract_page_text_calls();
+        assert_eq!(res1, res2, "两次检索命中/截断应完全一致");
+        assert_eq!(
+            after_second, after_first,
+            "第二次检索应完全复用缓存页文本（零重抽取）：first={after_first} second={after_second}"
+        );
+    }
+
     /// 纯逻辑（不触 pdfium）：字符盒回退策略 tight > loose > synthetic。
     #[test]
     fn resolve_char_box_prefers_tight_then_loose_then_synthetic() {
@@ -1116,6 +1159,62 @@
     /// 逐页探针：`page..page+count`（不越界 n）的顺序哈希。
     fn render_page_probes(worker: &PdfWorker, doc_id: DocId, page: usize, n: usize) -> Vec<(u32, u32, u64)> {
         (0..n).map(|i| render_page_probe(worker, doc_id, page + i)).collect()
+    }
+
+    /// 问题 A 守门测试（Worker 集成 + LoadPage 计数）：同页 K 个瓦片只触发一次
+    /// `pages().get`（= `FPDF_LoadPage`），其余全部命中 [`ActivePage`] 缓存复用句柄。
+    /// 判别式（K201/K173 防假绿）：撤掉本缓存（改回「每 tile 一次 get」）→ K 个瓦片即
+    /// K 次 LoadPage → `after - before == K` → 本测试红。计数用 `cfg(test)` 计数器
+    /// （[`render::active_page_loads`]），经共享单例 worker 走真实渲染路径（不在测试内
+    /// 二次绑定 pdfium——pdfium-render 的 bindings 是进程级 OnceCell，二次 `Pdfium::new`
+    /// 会污染全局与共享 worker）。夹具缺失 → SKIP（与本仓夹具约定一致）。
+    #[test]
+    fn active_page_loads_page_once_for_many_tiles() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        // 快照 LoadPage 计数，然后连续请求**同一页**的 K 个瓦片并全部收齐。
+        let before = render::active_page_loads();
+        let k = 6u32;
+        let reqs: Vec<_> = (0..k)
+            .map(|i| {
+                worker.request_tile(
+                    doc_id,
+                    TileRequest {
+                        page: 0,
+                        scale: 1.0,
+                        tile_size: config::pdf::TILE_SIZE,
+                        row: i,
+                        col: 0,
+                    },
+                    0,
+                    0,
+                )
+            })
+            .collect();
+        let mut finished = 0usize;
+        for rx in reqs {
+            match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(_) => finished += 1,
+                Err(e) => panic!("瓦片结果应可达：{e}"),
+            }
+        }
+        let after = render::active_page_loads();
+        assert!(
+            finished > 0,
+            "至少应有瓦片真正完成渲染（非空转）：finished={finished}"
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "同页 {k} 个瓦片应只 LoadPage 一次（ActivePage 命中复用），实际 {before} -> {after}（原实现为每 tile 一次 → {k} 次）",
+        );
     }
 
     /// 重排：整体反转后（1）页尺寸序列 = 原逆序（2）最前/最后 2 页渲染哈希 = 原末/首 2 页

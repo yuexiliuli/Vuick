@@ -7,33 +7,33 @@
 use std::cell::Cell;
 use std::ops::Range;
 
-use gpui::{
-    div, list, point, px, size, AnyElement, AnimationExt, App, Bounds, Context, DispatchPhase,
-    Element, ElementId, ElementInputHandler, Entity, EventEmitter, Focusable, FocusHandle,
-    GlobalElementId, HighlightStyle, Hsla, InteractiveElement, IntoElement, LayoutId, ListState,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledText, Window,
-    prelude::FluentBuilder as _,
-};
 use crate::actions::{
-    Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart,
-    IndentInline, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
-    MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, OutdentInline, Paste,
-    Redo, SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart,
-    SelectToStart, SelectToStartOfLine, Undo,
+    Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart, IndentInline,
+    MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight, MoveToEnd,
+    MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, OutdentInline, Paste, Redo, SelectAll,
+    SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart, SelectToStart,
+    SelectToStartOfLine, Undo,
 };
 use crate::editor::fold::BracketChar;
+use gpui::{
+    AnimationExt, AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId,
+    ElementInputHandler, Entity, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    HighlightStyle, Hsla, InteractiveElement, IntoElement, LayoutId, ListState, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Window, div, list, point,
+    prelude::FluentBuilder as _, px, size,
+};
 use ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
-use config::layout::{
-    BracketGuidesMode, BRACKET_GUIDES_MODE, BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_WIDTH,
-    EDITOR_RULER_COLUMNS,
-};
+use super::editing::bracket_guide_color;
 use super::{
-    CARET_WIDTH_PX, CodeEditor, EditorEvent, FindBtn, FOLD_ARROW_SLOT_PX, GUTTER_LEFT_PAD_PX,
+    CARET_WIDTH_PX, CodeEditor, EditorEvent, FOLD_ARROW_SLOT_PX, FindBtn, GUTTER_LEFT_PAD_PX,
     GUTTER_RIGHT_PAD_PX, MIN_VISIBLE_ROWS, RowData, RowView,
 };
-use super::editing::bracket_guide_color;
+use config::layout::{
+    BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_WIDTH, BRACKET_GUIDES_MODE, BracketGuidesMode,
+    EDITOR_RULER_COLUMNS,
+};
 
 // -------------------------------------------------------------------------
 // Render / Focusable / 事件
@@ -113,8 +113,14 @@ impl Render for CodeEditor {
 
         // 缩进引导线（indentation guides，§8 视觉主源）：逐可视行缩进级竖线叠层
         // （见 `indentation_guide_overlay`；默认开，VS Code 同款）。
-        let guides = self
-            .indentation_guide_overlay(vis_top, vis_off, lh, harea_w, view_h, window.scale_factor());
+        let guides = self.indentation_guide_overlay(
+            vis_top,
+            vis_off,
+            lh,
+            harea_w,
+            view_h,
+            window.scale_factor(),
+        );
 
         // 括号竖线（bracket guides）：竖线层按模式挂载（Off = 不画括对彩线，只留钩线；
         // Active/All 见 config/layout.rs:94 `BRACKET_GUIDES_MODE`（默认 Off，翻转常量即
@@ -356,7 +362,14 @@ impl CodeEditor {
             Vec::new()
         } else {
             self.bracket_guide_segments_flagged(
-                vis_top, vis_off, lh, sf, harea_w, view_h, active_pair, mode,
+                vis_top,
+                vis_off,
+                lh,
+                sf,
+                harea_w,
+                view_h,
+                active_pair,
+                mode,
             )
         };
         let palette = self.bracket_guide_palette;
@@ -1131,136 +1144,212 @@ fn attach_input_actions(
     entity: &Entity<CodeEditor>,
     window: &mut Window,
 ) -> gpui::Stateful<gpui::Div> {
-    core
-        .on_key_down(window.listener_for(entity, CodeEditor::on_key_down))
-        .on_mouse_down(MouseButton::Left, window.listener_for(entity, CodeEditor::on_mouse_down))
+    core.on_key_down(window.listener_for(entity, CodeEditor::on_key_down))
+        .on_mouse_down(
+            MouseButton::Left,
+            window.listener_for(entity, CodeEditor::on_mouse_down),
+        )
         .on_mouse_move(window.listener_for(entity, CodeEditor::on_mouse_move))
-        .on_mouse_up(MouseButton::Left, window.listener_for(entity, CodeEditor::on_mouse_up))
+        .on_mouse_up(
+            MouseButton::Left,
+            window.listener_for(entity, CodeEditor::on_mouse_up),
+        )
         // 拖出元素/窗口外松开（Capture 阶段、`!is_hovered`）→ 同样收口拖选态，防
         // `dragging` 残留（拖选生命周期终点之一，见 CodeEditor::cancel_mouse_drag）。
-        .on_mouse_up_out(MouseButton::Left, window.listener_for(entity, CodeEditor::on_mouse_up_out))
+        .on_mouse_up_out(
+            MouseButton::Left,
+            window.listener_for(entity, CodeEditor::on_mouse_up_out),
+        )
         // —— 输入 action（keymap 由 crate::actions::bind_input_keys 在 "Input" 上下文绑定，
         // 与菜单分发（dispatch_action Undo/Cut/…）共用同一套 handler ——
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveLeft, _w, cx| {
-            ed.arrow(false, -1, 0, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveRight, _w, cx| {
-            ed.arrow(false, 1, 0, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveUp, _w, cx| {
-            ed.arrow(false, 0, -1, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveDown, _w, cx| {
-            ed.arrow(false, 0, 1, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveHome, _w, cx| {
-            ed.move_line_start(false, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveEnd, _w, cx| {
-            ed.move_line_end(false, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectToStartOfLine, _w, cx| {
-            ed.move_line_start(true, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectToEndOfLine, _w, cx| {
-            ed.move_line_end(true, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveToStart, _w, cx| {
-            ed.move_doc_start(false, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveToEnd, _w, cx| {
-            ed.move_doc_end(false, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectToStart, _w, cx| {
-            ed.move_doc_start(true, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectToEnd, _w, cx| {
-            ed.move_doc_end(true, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveToPreviousWord, _w, cx| {
-            ed.move_word_left(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveToNextWord, _w, cx| {
-            ed.move_word_right(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectToPreviousWordStart, _w, cx| {
-            ed.select_word_left(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectToNextWordEnd, _w, cx| {
-            ed.select_word_right(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MovePageUp, _w, cx| {
-            ed.page(false, -1, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MovePageDown, _w, cx| {
-            ed.page(false, 1, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &Backspace, _w, cx| {
-            ed.backspace(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &Delete, _w, cx| {
-            ed.delete_forward(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &DeleteToPreviousWordStart, _w, cx| {
-            ed.backspace_word(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &DeleteToNextWordEnd, _w, cx| {
-            ed.delete_word_forward(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &IndentInline, _w, cx| {
-            ed.tab(false, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &OutdentInline, _w, cx| {
-            ed.tab(true, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectAll, _w, cx| {
-            ed.select_all(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &Undo, _w, cx| {
-            ed.undo(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &Redo, _w, cx| {
-            ed.redo(cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &Copy, window, cx| {
-            ed.copy(window, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &Cut, window, cx| {
-            ed.cut(window, cx);
-            cx.stop_propagation()
-        }))
-        .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &Paste, window, cx| {
-            ed.paste(window, cx);
-            cx.stop_propagation()
-        }))
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveLeft, _w, cx| {
+                ed.arrow(false, -1, 0, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveRight, _w, cx| {
+                ed.arrow(false, 1, 0, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveUp, _w, cx| {
+                ed.arrow(false, 0, -1, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveDown, _w, cx| {
+                ed.arrow(false, 0, 1, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveHome, _w, cx| {
+                ed.move_line_start(false, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveEnd, _w, cx| {
+                ed.move_line_end(false, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(window.listener_for(
+            entity,
+            |ed: &mut CodeEditor, _: &SelectToStartOfLine, _w, cx| {
+                ed.move_line_start(true, cx);
+                cx.stop_propagation()
+            },
+        ))
+        .on_action(window.listener_for(
+            entity,
+            |ed: &mut CodeEditor, _: &SelectToEndOfLine, _w, cx| {
+                ed.move_line_end(true, cx);
+                cx.stop_propagation()
+            },
+        ))
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveToStart, _w, cx| {
+                ed.move_doc_start(false, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveToEnd, _w, cx| {
+                ed.move_doc_end(false, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectToStart, _w, cx| {
+                ed.move_doc_start(true, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectToEnd, _w, cx| {
+                ed.move_doc_end(true, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(window.listener_for(
+            entity,
+            |ed: &mut CodeEditor, _: &MoveToPreviousWord, _w, cx| {
+                ed.move_word_left(cx);
+                cx.stop_propagation()
+            },
+        ))
+        .on_action(window.listener_for(
+            entity,
+            |ed: &mut CodeEditor, _: &MoveToNextWord, _w, cx| {
+                ed.move_word_right(cx);
+                cx.stop_propagation()
+            },
+        ))
+        .on_action(window.listener_for(
+            entity,
+            |ed: &mut CodeEditor, _: &SelectToPreviousWordStart, _w, cx| {
+                ed.select_word_left(cx);
+                cx.stop_propagation()
+            },
+        ))
+        .on_action(window.listener_for(
+            entity,
+            |ed: &mut CodeEditor, _: &SelectToNextWordEnd, _w, cx| {
+                ed.select_word_right(cx);
+                cx.stop_propagation()
+            },
+        ))
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MovePageUp, _w, cx| {
+                ed.page(false, -1, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &MovePageDown, _w, cx| {
+                ed.page(false, 1, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &Backspace, _w, cx| {
+                ed.backspace(cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &Delete, _w, cx| {
+                ed.delete_forward(cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(window.listener_for(
+            entity,
+            |ed: &mut CodeEditor, _: &DeleteToPreviousWordStart, _w, cx| {
+                ed.backspace_word(cx);
+                cx.stop_propagation()
+            },
+        ))
+        .on_action(window.listener_for(
+            entity,
+            |ed: &mut CodeEditor, _: &DeleteToNextWordEnd, _w, cx| {
+                ed.delete_word_forward(cx);
+                cx.stop_propagation()
+            },
+        ))
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &IndentInline, _w, cx| {
+                ed.tab(false, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &OutdentInline, _w, cx| {
+                ed.tab(true, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &SelectAll, _w, cx| {
+                ed.select_all(cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &Undo, _w, cx| {
+                ed.undo(cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &Redo, _w, cx| {
+                ed.redo(cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &Copy, window, cx| {
+                ed.copy(window, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &Cut, window, cx| {
+                ed.cut(window, cx);
+                cx.stop_propagation()
+            }),
+        )
+        .on_action(
+            window.listener_for(entity, |ed: &mut CodeEditor, _: &Paste, window, cx| {
+                ed.paste(window, cx);
+                cx.stop_propagation()
+            }),
+        )
 }
 
 /// 行元素：文本 + 光标。行号 gutter 已是编辑区左侧固定叠层（见 render `gutter`），
@@ -1326,7 +1415,8 @@ fn row_element(rd: &RowData, rv: &RowView, window: &mut Window) -> gpui::Div {
 /// 不做窗口截取（避免为收益可忽略的行走「字符→宽度」换算与 `layout_width` 调用）。
 /// 有效触发阈值 = 行宽 > `可视窗宽 + 2×[`LONG_LINE_HVIEW_MARGIN_UNITS`] 余量`
 /// （见 [`styled_row_text`]：行在 `x_right` 内放得下即回落整行，None）。
-const LONG_LINE_HVIEW_MIN_CHARS: usize = 128;
+/// pub(crate)：`rows::build_rows` 用它预筛「可能深横滚的超长行」才建宽度索引。
+pub(crate) const LONG_LINE_HVIEW_MIN_CHARS: usize = 128;
 
 /// 超长行「横向窗口化」的可视窗两侧**过扫余量**（宽度单位，× 格宽 = px）：
 /// 裁剪左/右缘都取「可视窗 ± 余量」，再按**真实字形宽**（`layout_width`）落字符边界。
@@ -1335,6 +1425,7 @@ const LONG_LINE_HVIEW_MIN_CHARS: usize = 128;
 pub(crate) const LONG_LINE_HVIEW_MARGIN_UNITS: usize = 32;
 
 /// 超长行横滚窗口的截取结果（见 [`window_bytes_and_offset`]）。
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) struct LongLineWindow {
     /// 截取字节区间（行内，两端均落在 UTF-8 字符边界——绝不劈开多字节字符/emoji）。
     pub(crate) bytes: Range<usize>,
@@ -1354,6 +1445,10 @@ pub(crate) struct LongLineWindow {
 /// - 窗口按当前 `hscroll`（渲染期快照于 `RowView`）现算，每次横滚都随重绘更新；
 ///   不给窗口/偏移加缓存层（任务约束），成本 = 一次「0 → 窗口右缘」的逐字宽累加
 ///   （≤ 可视窗 + 2×余量字符数，与行总长无关的算术，远低于整行 shape）。
+/// - **深横滚快道**：超长行且已横滚（`build_rows` 预建了每字符前缀宽索引
+///   [`RowCumWidths`]，随 `rd.widths` 传入）时，走 `window_bytes_and_offset_with_widths`
+///   的二分路径——起点/偏移/终点直接由索引定位，每帧不再重扫 O(hscroll) 前缀
+///   （minified JS/JSON 等的每帧 O(前缀) 扫描，见 `window_bytes_and_offset_with_widths`）。
 /// - 返回 `(StyledText, 左偏移 px)`；`row_element` 用偏移定位子串，保持滚动几何。
 fn styled_row_text(rd: &RowData, rv: &RowView, window: &mut Window) -> (StyledText, f32) {
     // 咽喉点兜底：`rd.highlights()` 是行内字节区间（md 滤镜 / syntect 缓存 / 选区合并
@@ -1370,6 +1465,7 @@ fn styled_row_text(rd: &RowData, rv: &RowView, window: &mut Window) -> (StyledTe
         rv.char_width,
         &rv.mono,
         rv.font_size,
+        rd.widths.as_deref(),
         window,
     ) {
         let LongLineWindow { bytes, offset_px } = win;
@@ -1378,7 +1474,10 @@ fn styled_row_text(rd: &RowData, rv: &RowView, window: &mut Window) -> (StyledTe
         let aligned = char_align_highlights(cropped.as_ref(), &shifted);
         return (StyledText::new(cropped).with_highlights(aligned), offset_px);
     }
-    (StyledText::new(rd.content.text.clone()).with_highlights(highlights), 0.)
+    (
+        StyledText::new(rd.content.text.clone()).with_highlights(highlights),
+        0.,
+    )
 }
 
 /// 超长行横向窗口化的「计算侧」公共入口（`styled_row_text` 与测试探针共用，保证
@@ -1391,6 +1490,7 @@ pub(crate) fn long_line_window(
     char_width: f32,
     mono: &SharedString,
     font_size: Pixels,
+    widths: Option<&RowCumWidths>,
     window: &mut Window,
 ) -> Option<LongLineWindow> {
     if text.len() <= LONG_LINE_HVIEW_MIN_CHARS
@@ -1420,7 +1520,117 @@ pub(crate) fn long_line_window(
             w
         }
     };
-    window_bytes_and_offset(text, x_left, x_right, &mut char_w)
+    window_bytes_and_offset_with_widths(text, x_left, x_right, &mut char_w, widths)
+}
+
+/// 深横滚快道的「每字符前缀真实宽」扁平索引（由 [`build_row_cum_widths`] 一次物化，
+/// 跨帧缓存于 `RowWidthCache`、随 `RowData.widths` 传入渲染）。
+///
+/// - `cum[i]` = 前 `i` 个字符的**真实渲染宽**和（`cum.len() == 字符数+1`、`cum[0]==0`）；
+/// - `byte_offs[i]` = 第 `i` 个字符起点的**字节偏移**（与 `cum` 平行、同长，落到 UTF-8
+///   字符边界；u32 存以省内存，行 > 4 GiB 时不建索引回落逐字扫描）；
+/// - 零宽字符（组合符等 `w<=0`）不推进 `cum`——与逐字扫描的 `w <= 0.0 → continue`
+///   逐位一致，故二分定位结果与扫描等价。
+///
+/// 宽度单调不减 → 起点/终点的「首个越过阈值」都可在 `cum` 上二分（O(log 字符数)），
+/// 起点偏移直接读 `cum[s]`（= 前缀真实宽，与扫描累加同值），把超长行深横滚每帧的
+/// 「0 → 右缘」O(前缀) 逐字布局查询降为 O(log + 可视窗) 量级（minified 行收益最大）。
+pub(crate) struct RowCumWidths {
+    pub(crate) cum: Vec<f32>,
+    pub(crate) byte_offs: Vec<u32>,
+}
+
+/// 物化一行的前缀宽索引：按行文本逐字符用 `char_w`（生产 = TextSystem 真实字形宽，
+/// 测试 = `char_width_units` 等宽度函数）累加一次，O(字符数)。偶发性的一次成本，
+/// 之后深横滚窗口化每帧只 O(log + 视窗) 消费本索引。`None` = 行超 4GiB（u32 偏移
+/// 溢出）或极短行无收益（外层另有长度门）。
+pub(crate) fn build_row_cum_widths(
+    text: &str,
+    char_w: &mut impl FnMut(char) -> f32,
+) -> Option<RowCumWidths> {
+    if text.len() > u32::MAX as usize {
+        return None; // u32 字节偏移溢出 → 回落逐字扫描
+    }
+    let mut cum = Vec::with_capacity(text.len().saturating_add(1));
+    let mut byte_offs = Vec::with_capacity(cum.capacity());
+    cum.push(0.0);
+    byte_offs.push(0);
+    let mut x = 0.0f32;
+    let mut byte = 0usize;
+    for ch in text.chars() {
+        let w = char_w(ch);
+        if w > 0.0 {
+            x += w;
+        }
+        byte += ch.len_utf8();
+        cum.push(x);
+        byte_offs.push(byte as u32);
+    }
+    Some(RowCumWidths { cum, byte_offs })
+}
+
+/// 生产侧建索引（`build_rows` 用）：等宽字体族 + 字号解析真实字形宽后建
+/// [`RowCumWidths`]。与 `long_line_window` 的 `char_w` 同一 `layout_width` 口径；
+/// 同字符连续段用备忘短路，长同质行（minified "xxx…"）只查一次字体。
+pub(crate) fn build_row_cum_widths_real(
+    text: &str,
+    mono: &SharedString,
+    font_size: Pixels,
+    window: &mut Window,
+) -> Option<RowCumWidths> {
+    let ts = window.text_system();
+    let font_id = ts.resolve_font(&gpui::font(mono.clone()));
+    let mut last: Option<(char, f32)> = None;
+    build_row_cum_widths(text, &mut |ch| {
+        if let Some((lc, lw)) = last
+            && lc == ch
+        {
+            return lw;
+        }
+        let w = ts.layout_width(font_id, font_size, ch).as_f32();
+        last = Some((ch, w));
+        w
+    })
+}
+
+/// 用 [`RowCumWidths`] 的二分路径定位横向窗口（结果与逐字扫描逐位等价，见
+/// `window_bytes_and_offset_with_widths` 的推导）：
+/// - 终点字符（排他）`e` = 首个 `cum[k] ≥ x_right` 的 `k`；若行尾恰切在右缘
+///   （`e == n` 且 `cum[n] == x_right`，最后一个字符以右缘结束、其后整行都放得下）
+///   → 回落 `None`（与扫描的「循环走完 → None」一致）；
+/// - 起点字符 `s` = 首个 `cum[j] > x_left` 的 `j − 1`（该字符下沿越过 x_left，整字包含）；
+/// - `offset_px = cum[s]`（起点前真实前缀宽）、字节区间 `byte_offs[s] .. byte_offs[e]`。
+/// 未锁定左缘（整行窄于 x_left，`s` 不存在）→ 走扫描同款防御分支（`0 .. byte_offs[e]`）。
+fn window_by_width_index(
+    x_left: f32,
+    x_right: f32,
+    widths: &RowCumWidths,
+) -> Option<LongLineWindow> {
+    let cum = &widths.cum;
+    let byte_offs = &widths.byte_offs;
+    let n = cum.len().saturating_sub(1); // 字符数
+    if n == 0 {
+        return None;
+    }
+    // 终点（排他字符下标 e）与起点（字符下标 s），均在单调不减的 cum 上二分。
+    let e = cum.partition_point(|&c| c < x_right); // 首个 cum ≥ x_right 的下标
+    let e = (e <= n).then_some(e); // e==len → 整行 < x_right → 放得下 → None
+    let s = {
+        let j = cum.partition_point(|&c| c <= x_left); // 首个 cum > x_left 的下标
+        (j > 0 && j <= n).then_some(j - 1) // 起点字符 = j−1；J==len → 未锁定左缘 → None
+    };
+    match (s, e) {
+        (Some(s), Some(e)) if e > s && !(e == n && cum[n] == x_right) => Some(LongLineWindow {
+            bytes: byte_offs[s] as usize..byte_offs[e] as usize,
+            offset_px: cum[s],
+        }),
+        // 未锁定左缘（整行窄于 x_left）：终点命中处 = 前缀 + 偏移 0（扫描防御分支）。
+        (None, Some(e)) if e > 0 => Some(LongLineWindow {
+            bytes: 0..byte_offs[e] as usize,
+            offset_px: 0.0,
+        }),
+        _ => None,
+    }
 }
 
 /// 纯函数（核心窗口算法）：给定「每字符渲染宽度」`char_w`，求横向窗口的字节区间与
@@ -1437,11 +1647,40 @@ pub(crate) fn window_bytes_and_offset(
     text: &str,
     x_left: f32,
     x_right: f32,
+    char_w: impl FnMut(char) -> f32,
+) -> Option<LongLineWindow> {
+    window_bytes_and_offset_with_widths(text, x_left, x_right, char_w, None)
+}
+
+/// [`window_bytes_and_offset`] 的**深横滚快道**：额外的 `widths` = 该行的前缀真实宽
+/// 索引（[`RowCumWidths`]，由 `build_rows` 预建、随 `RowData.widths` 传入）。
+///
+/// - `widths = Some` 且 `x_left > 0`（已深横滚）→ 走 `window_by_width_index` 二分：
+///   起点/终点/偏移直接由索引定位，**不再逐字重扫码前缀**——把每帧 O(hscroll) 的
+///   `layout_width` 查询降为 O(log 字符数) 数组二分 + 视窗量级的 O(1) 读数。
+/// - `widths = None` 或未横滚 → 回落下方**逐字扫描**（原实现，语义逐位不变）。
+///
+/// 两条路径结果**逐位等价**（宽度单调不减 → 累计宽在字符上二分成立）：起点 = 首个
+/// 越过 x_left 右缘的整字、终点排他 = 首个起点 ≥ x_right 的字符、偏移 = 起点前真实
+/// 前缀宽——CJK/emoji 多字节字符不被劈开（字节区间取自 `byte_offs[s..e]`，落字符
+/// 边界）。
+pub(crate) fn window_bytes_and_offset_with_widths(
+    text: &str,
+    x_left: f32,
+    x_right: f32,
     mut char_w: impl FnMut(char) -> f32,
+    widths: Option<&RowCumWidths>,
 ) -> Option<LongLineWindow> {
     if text.is_empty() || x_right <= x_left {
         return None;
     }
+    // 深横滚快道：已具宽度索引 → 二分定位，不重扫前缀。
+    if x_left > 0.0
+        && let Some(w) = widths
+    {
+        return window_by_width_index(x_left, x_right, w);
+    }
+    // —— 逐字扫描（未深滚 / 无索引时语义不变）——
     let mut x = 0.0f32;
     let mut byte = 0usize;
     let mut start_byte = 0usize;
@@ -1549,10 +1788,11 @@ pub(crate) fn merge_highlights(
         bounds.push(e);
     }
     if let Some(s) = &sel
-        && s.end > s.start {
-            bounds.push(s.start);
-            bounds.push(s.end);
-        }
+        && s.end > s.start
+    {
+        bounds.push(s.start);
+        bounds.push(s.end);
+    }
     bounds.sort_unstable();
     bounds.dedup();
 
@@ -1573,9 +1813,10 @@ pub(crate) fn merge_highlights(
         // 跳过 `end <= a` 后，`runs[ri]` 即首个可能覆盖 [a, b) 的段：`start < b` 则覆盖
         // （runs 非重叠 ⇒ 其后段起点更大，不可能更早覆盖本单元）。
         if let Some((r, s)) = runs.get(ri)
-            && r.start < b {
-                style = *s;
-            }
+            && r.start < b
+        {
+            style = *s;
+        }
         if sel.as_ref().is_some_and(|s| a >= s.start && b <= s.end) {
             style.background_color = Some(sel_bg);
         }
@@ -1639,9 +1880,10 @@ pub(crate) fn merge_multi_highlights(
         }
         let mut style = HighlightStyle::default();
         if let Some((r, s)) = runs.get(ri)
-            && r.start < b {
-                style = *s;
-            }
+            && r.start < b
+        {
+            style = *s;
+        }
         // overlays 互不重叠：首个 `end > a` 者即唯一可能覆盖本单元的 overlay。
         if let Some((o, os)) = overlays.get(oi)
             && o.start < b
@@ -1706,9 +1948,10 @@ pub(crate) fn merge_color_overrides(
         }
         let mut style = HighlightStyle::default();
         if let Some((r, s)) = base.get(bi)
-            && r.start < b {
-                style = *s;
-            }
+            && r.start < b
+        {
+            style = *s;
+        }
         // chars 互不重叠（单字节升序）：首个 `col+1 > a` 者即唯一可能覆盖本单元的字符。
         if let Some(c) = chars.get(ci)
             && c.col < b
@@ -1790,7 +2033,11 @@ fn number_element(
     let number = SharedString::from((ix + 1).to_string());
     // 活动行 = 有底色且非折叠行（折叠行保持灰显在折叠底色上）。
     let active = bg.is_some() && !folded;
-    let number_selector = if active { "ce-gutter-number-active" } else { "ce-gutter-number" };
+    let number_selector = if active {
+        "ce-gutter-number-active"
+    } else {
+        "ce-gutter-number"
+    };
     div()
         .h(gv.line_height)
         .flex()
@@ -1803,9 +2050,12 @@ fn number_element(
         // 光标行/折叠行高亮延伸到行号列：整格（含行号+箭头槽）铺同一底色；有底色时
         // 按行语义挂分叉 selector（折叠 `ce-gutter-fold-bg` / 光标 `ce-gutter-active-bg`）。
         .when_some(bg, |this, color| {
-            let sel = if folded { "ce-gutter-fold-bg" } else { "ce-gutter-active-bg" };
-            this.debug_selector(move || sel.into())
-                .bg(color)
+            let sel = if folded {
+                "ce-gutter-fold-bg"
+            } else {
+                "ce-gutter-active-bg"
+            };
+            this.debug_selector(move || sel.into()).bg(color)
         })
         .child(
             div()
@@ -1885,7 +2135,6 @@ impl ScrollbarHandle for VerticalScrollHandle {
         size(px(self.content_width), px(self.content_height))
     }
 }
-
 
 /// 包装元素：把内部 UI 委托给 gpui 布局/绘制，同时在 paint 阶段挂上
 /// `hand_input`（IME/文本输入），并回写元素边界供坐标换算。
@@ -2044,7 +2293,10 @@ mod tests {
         assert_eq!((top, h), (10.0, 60.0));
         assert_eq!(top * 2.0, 20.0, "(a) 顶在设备格");
         assert_eq!((top + h) * 2.0, 140.0, "(a) 底在设备格");
-        assert!((top + h) * 2.0 <= (10.2 + 60.0) * 2.0, "(b) 底不越过原底 140.4");
+        assert!(
+            (top + h) * 2.0 <= (10.2 + 60.0) * 2.0,
+            "(b) 底不越过原底 140.4"
+        );
 
         // .5 临界：round 半离开 0 → 顶 10.75*2=21.5 → 22 → 11.0；底 22+3*20=82。
         let (top, h) = CodeEditor::snap_guide_extent(10.75, 30.0, 10.0, 2.0);
@@ -2071,13 +2323,19 @@ mod tests {
         assert_eq!(gy * sf, 75.0, "(a) 顶就近在设备格");
         assert_eq!((gy + gh) * sf, 525.0, "(c) 底 = 75 + 6*75 行网格");
         assert!(((gy + gh) * sf).fract() == 0.0, "(a) 顶/底都在设备格");
-        assert!((gy + gh) * sf <= (43.08 + 258.46) * sf, "(b) 不越过原底 527.695");
+        assert!(
+            (gy + gh) * sf <= (43.08 + 258.46) * sf,
+            "(b) 不越过原底 527.695"
+        );
 
         // 3 行块：底 75 + 3*75 = 300。
         let (gy, gh) = CodeEditor::snap_guide_extent(43.08, 129.23, lh, sf);
         assert_eq!(gy * sf, 75.0);
         assert_eq!((gy + gh) * sf, 300.0, "(c) 3 行档 = 75+3*75");
-        assert!((gy + gh) * sf <= (43.08 + 129.23) * sf, "(b) 不越过原底 301.54");
+        assert!(
+            (gy + gh) * sf <= (43.08 + 129.23) * sf,
+            "(b) 不越过原底 301.54"
+        );
     }
 
     /// 退化输入（`h` 极小，仅纯函数边界用例，真实路径 `h ≥ lh` 恒满足）：段占整行数
@@ -2198,7 +2456,11 @@ mod tests {
         assert_eq!(w.offset_px, 10.);
         // 起始位置切在某个「中」中间（单位 11）→ 整字包含、起点抬到该字开头。
         let w = window_bytes_and_offset(&text, 11., 31., units_w).unwrap();
-        assert_eq!(w.bytes, 15..48, "不劈开 CJK：起点落到包含 11 的首字（单位 10）");
+        assert_eq!(
+            w.bytes,
+            15..48,
+            "不劈开 CJK：起点落到包含 11 的首字（单位 10）"
+        );
         // 结束位置落在字中间（29）→ 终点止于「起点 ≥ 29」的下一字（单位 30 起），
         // 之前整字（第 14 字，单位 [28,30) 部分可见）全含 → 字节 0 .. 15*3。
         let w = window_bytes_and_offset(&text, 0., 29., units_w).unwrap();
@@ -2252,7 +2514,11 @@ mod tests {
         let s = HighlightStyle::default();
         let runs = vec![(0..10, s), (8..20, s), (100..110, s)];
         let out = shift_highlights(&runs, 5, 10); // 窗 [5, 15)
-        assert_eq!(out, vec![(0..5, s), (3..10, s)], "首段收窄+平移、窗内段平移、窗外段丢弃");
+        assert_eq!(
+            out,
+            vec![(0..5, s), (3..10, s)],
+            "首段收窄+平移、窗内段平移、窗外段丢弃"
+        );
         // 空窗不产出。
         assert!(shift_highlights(&runs, 20, 0).is_empty());
     }
@@ -2278,5 +2544,87 @@ mod tests {
         );
         assert_eq!(w.offset_px, 100_000., "深滚左偏移 = 前缀宽");
     }
-}
 
+    /// 红测（性能结构）：深横滚既有宽度索引时，窗口化不得再逐字重扫前缀。
+    /// 判别式：把 `window_bytes_and_offset_with_widths` 的 `Some(widths)` 分支退回
+    /// 逐字扫描 → `char_w` 访问 O(100k)、本断言红；实现二分快道后 → 绿。
+    #[test]
+    fn window_deep_scroll_widths_index_not_prefix_scan() {
+        let text = "x".repeat(200_000);
+        // 建索引 = 一次性摊销价（每字符一次真实宽查询，属缓存构建，不计窗口化成本）。
+        let widths = build_row_cum_widths(&text, &mut |_| 1.0).unwrap();
+        // 已建索引的深横滚（x_left=100k）窗口化自身的字符访问：不得 O(100k)。
+        let mut calls = 0usize;
+        let w = window_bytes_and_offset_with_widths(
+            &text,
+            100_000.,
+            100_080.,
+            |ch| {
+                calls += 1;
+                units_w(ch)
+            },
+            Some(&widths),
+        )
+        .unwrap();
+        assert!(
+            calls <= 8,
+            "深横滚窗口化应走索引/二分、不逐字查宽（calls={calls}）"
+        );
+        assert_eq!(w.bytes, 100_000..100_080);
+        assert_eq!(w.offset_px, 100_000.);
+    }
+
+    /// 快道（宽度索引二分）与逐字扫描必须逐位等价——覆盖 CJK/emoji/混排/右缘恰切
+    /// 行尾/零宽等既有边界：改快道不得悄悄改窗口语义。
+    #[test]
+    fn width_index_fast_path_matches_scan_equivalence() {
+        let cases: Vec<(String, f32, f32)> = vec![
+            ("中".repeat(30), 10., 30.),
+            ("中".repeat(30), 11., 31.),
+            ("中".repeat(30), 0., 29.),
+            ("🍎".repeat(20), 9., 15.),
+            ("a中b中c".to_string(), 2., 4.),
+            ("x".repeat(200), 100., 140.),
+            ("x".repeat(3), 0., 3.), // 行尾恰切在右缘：循环走完 → None
+            ("x".repeat(200_000), 100_000., 100_080.),
+        ];
+        for (text, xl, xr) in cases {
+            let widths = build_row_cum_widths(&text, &mut units_w).unwrap();
+            let scan = window_bytes_and_offset(&text, xl, xr, units_w);
+            let fast = window_bytes_and_offset_with_widths(&text, xl, xr, units_w, Some(&widths));
+            assert_eq!(fast, scan, "快道与扫描对 {text:?}[{xl},{xr}) 应等价");
+        }
+    }
+
+    /// 零宽字符（组合符）+ 深滚：快道不劈开、不把前缀组合字丢弃，且与扫描等价。
+    #[test]
+    fn width_index_fast_path_matches_scan_zero_width() {
+        // "x…x" 前缀含组合重音（≈0 宽）：扫描与快道在 x_left 落在组合字位置时同解。
+        let text = format!("x\u{301}{}", "y".repeat(1000));
+        let widths = build_row_cum_widths(&text, &mut |ch| {
+            if ch == '\u{301}' { 0.0 } else { 1.0 }
+        })
+        .unwrap();
+        for (xl, xr) in [(0.5, 200.), (1.5, 210.), (500., 700.)] {
+            let scan =
+                window_bytes_and_offset(
+                    &text,
+                    xl,
+                    xr,
+                    |ch| {
+                        if ch == '\u{301}' { 0.0 } else { 1.0 }
+                    },
+                );
+            let fast = window_bytes_and_offset_with_widths(
+                &text,
+                xl,
+                xr,
+                |ch| {
+                    if ch == '\u{301}' { 0.0 } else { 1.0 }
+                },
+                Some(&widths),
+            );
+            assert_eq!(fast, scan, "快道与扫描对 x_left={xl} 应等价");
+        }
+    }
+}

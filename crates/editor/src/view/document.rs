@@ -21,6 +21,11 @@ use gpui::{
 };
 use ropey::Rope;
 
+#[cfg(test)]
+use super::CODE_EDITOR_FULL_RESET_CALLS;
+use super::{
+    CodeEditor, EditorEvent, FindTipState, HlFill, LIST_WINDOW_ROWS, RowCache, RowWidthCache,
+};
 use crate::editor::fold::{
     FoldMap,
 };
@@ -35,16 +40,6 @@ use crate::editor::{
     Buffer,
     Selection,
 };
-use super::{
-    CodeEditor,
-    EditorEvent,
-    FindTipState,
-    HlFill,
-    RowCache,
-    LIST_WINDOW_ROWS,
-};
-#[cfg(test)]
-use super::CODE_EDITOR_FULL_RESET_CALLS;
 
 impl CodeEditor {
     /// 创建编辑器（空文档）。
@@ -69,6 +64,7 @@ impl CodeEditor {
             hl_dirty: None,
             hl_fill: HlFill::default(),
             row_cache: RowCache::default(),
+            row_width_cache: RowWidthCache::default(),
             md_decor: MarkdownDecor::default(),
             md_mode: false,
             language: None,
@@ -90,7 +86,10 @@ impl CodeEditor {
             gutter_fg: ui::theme::Theme::light().colors.fg_muted.into(),
             sel_bg: ui::theme::Theme::light().colors.editor_selection_bg.into(),
             fold_bg: ui::theme::Theme::light().colors.editor_fold_bg.into(),
-            active_line_bg: ui::theme::Theme::light().colors.editor_active_line_bg.into(),
+            active_line_bg: ui::theme::Theme::light()
+                .colors
+                .editor_active_line_bg
+                .into(),
             caret_color: ui::theme::Theme::light().colors.fg.into(),
             marked_range: None,
             last_edit: None,
@@ -123,7 +122,11 @@ impl CodeEditor {
             scan_dirty_edit: false,
             scan_pending_edit: None,
             scan_multi_edit: false,
-            ruler_color: ui::theme::Theme::light().colors.fg_muted.opacity(0.55).into(),
+            ruler_color: ui::theme::Theme::light()
+                .colors
+                .fg_muted
+                .opacity(0.55)
+                .into(),
             guide_color: ui::theme::Theme::light().colors.guide_inactive.into(),
             active_guide_color: ui::theme::Theme::light().colors.guide_active.into(),
             bracket_guide_palette: ui::theme::Theme::light()
@@ -139,7 +142,10 @@ impl CodeEditor {
             find: crate::editor::find::FindOverlay::default(),
             _find_sub: None,
             find_match_bg: ui::theme::Theme::light().colors.editor_find_match_bg.into(),
-            find_current_bg: ui::theme::Theme::light().colors.editor_find_current_bg.into(),
+            find_current_bg: ui::theme::Theme::light()
+                .colors
+                .editor_find_current_bg
+                .into(),
             find_input: None,
             find_tip: FindTipState::default(),
             goto: crate::editor::goto::GoToOverlay::default(),
@@ -218,8 +224,12 @@ impl CodeEditor {
     ) {
         #[cfg(test)]
         CODE_EDITOR_FULL_RESET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.buffer
-            .replace_text_keep_id(text, max_line_chars, line_width_histogram, tail_append_row);
+        self.buffer.replace_text_keep_id(
+            text,
+            max_line_chars,
+            line_width_histogram,
+            tail_append_row,
+        );
         self.reset_document_impl(true, true);
     }
 
@@ -231,7 +241,8 @@ impl CodeEditor {
         max_line_chars: usize,
         line_width_histogram: crate::editor::buffer::LineWidthHistogram,
     ) {
-        self.buffer.apply_stats(max_line_chars, line_width_histogram);
+        self.buffer
+            .apply_stats(max_line_chars, line_width_histogram);
     }
 
     /// 大文档「分块渐进装配」追加一块已归一化文本（整行语义）：只把该块追到 Buffer
@@ -286,6 +297,8 @@ impl CodeEditor {
         // 整篇替换：行级缓存同样显式清空（`Buffer::new` 后 version 归零，同防
         // 「新旧文档同 version=0」命中上一份文档的行静态内容）。
         self.row_cache.clear();
+        // 超长行宽度索引同源失效（version 归零防旧索引命中新文档）。
+        self.row_width_cache.clear();
         // Markdown「所见即所得」滤镜缓存无需作废：缓存键含文档身份（`Buffer::id`，
         // O(1)）+ version，`Buffer::new` 后 version 归零、id 必新，也不会命中上一份
         // 文档的样式区间，`scan_window` 首扫即身份 miss → 按新文档自愈（M0.3；勿再手加
@@ -297,7 +310,10 @@ impl CodeEditor {
         // 诊断：`desired_scroll` 直写零的调用点（真机「47→2」若此处命中即编辑区被打回顶）。
         crate::diag::ed_scroll(
             "reset_document_impl.desired_zero",
-            &format!("row_count={} keep_highlight={keep_highlight}", self.row_count),
+            &format!(
+                "row_count={} keep_highlight={keep_highlight}",
+                self.row_count
+            ),
         );
         // 整篇替换：折叠视图投影一并清空（文本结构已变）。
         self.folds.clear();
@@ -368,7 +384,11 @@ impl CodeEditor {
     /// `false`；同长异字在「同源 Rope + 确定性 op」下不可能发生（且由 app 层全文等价测试
     /// 兜底）。干跑 + 长度栏都不通过 → **不改动缓冲区**，由调用方回退既有行级 diff 管线
     /// （`app::diff`）。
-    pub fn apply_live_replay(&mut self, ops: &[(Range<usize>, gpui::SharedString)], expected: &str) -> bool {
+    pub fn apply_live_replay(
+        &mut self,
+        ops: &[(Range<usize>, gpui::SharedString)],
+        expected: &str,
+    ) -> bool {
         if ops.is_empty() {
             return expected == self.text_string();
         }
@@ -578,7 +598,11 @@ impl CodeEditor {
     /// 就地编辑并同步行数（O(log n) 缓冲编辑）。固定窗口虚拟化下列表条目数与文档
     /// 无关，无需 splice——只更新 `row_count`；后续 `reveal_caret` 会按新光标行
     /// 重新定位窗口。
-    pub(super) fn apply_edit_synced(&mut self, range: Range<usize>, text: &str) -> crate::editor::buffer::Edit {
+    pub(super) fn apply_edit_synced(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+    ) -> crate::editor::buffer::Edit {
         // WY_TRACE breakdown：编辑主链「缓冲应用」段（O(log n) Rope 编辑 + 高亮增量登记）。
         let _t_apply = crate::prof::begin();
         // 先取被替换区间的**编辑前**行跨度（折叠区间同步需要，编辑后行号已变）。
@@ -601,12 +625,13 @@ impl CodeEditor {
         // 折叠候选 / 括号配对：**不再同步整篇重扫**（大文档逐键卡顿）。行数变了或
         // 文本含括号字符 → 登记**单个**受影响行段描述，由下一帧 render 挂起一轮
         // 后台**增量**刷新（受影响包络局部重扫 + 尾部行号平移，见 `fold.rs`）。
-        let has_bracket =
-            text.bytes().any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'))
-                || edit
-                    .old_text
-                    .bytes()
-                    .any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'));
+        let has_bracket = text
+            .bytes()
+            .any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'))
+            || edit
+                .old_text
+                .bytes()
+                .any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'));
         if self.row_count != prev_rows || has_bracket {
             // min_stop = 新坐标下首个未受影响行（替换文本占 `insert_rows` 行）。
             self.mark_scan_dirty_incremental(
@@ -626,7 +651,12 @@ impl CodeEditor {
     ///
     /// `line_a` = 编辑首行（编辑前坐标），`min_stop` = 新坐标下首个未受影响行
     /// （受影响包络闭区间上界），`delta` = 净行增量（新行数 − 旧行数）。
-    pub(super) fn mark_scan_dirty_incremental(&mut self, line_a: usize, min_stop: usize, delta: i64) {
+    pub(super) fn mark_scan_dirty_incremental(
+        &mut self,
+        line_a: usize,
+        min_stop: usize,
+        delta: i64,
+    ) {
         self.scan_dirty_edit = true;
         if self.scan_multi_edit || self.scan_pending_edit.is_some() {
             self.scan_multi_edit = true;

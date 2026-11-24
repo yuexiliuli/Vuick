@@ -13,8 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{App, FocusHandle, Window};
 use gpui::AppContext as _;
+use gpui::{App, FocusHandle, Window};
 use session_store::{
     ReadingProgress, SessionManifest, SessionTab, clear_session, prune_unreferenced_slots,
     reading_progress, write_manifest, write_slot,
@@ -23,7 +23,7 @@ use session_store::{
 use config::user::UserPrefs;
 
 use crate::host::AppHost;
-use crate::model::{AppModel, DetachedTab, EditorTab, MediaReader, MdWyInstall, TabPayload};
+use crate::model::{AppModel, DetachedTab, EditorTab, MdWyInstall, MediaReader, TabPayload};
 
 /// 主窗口尺寸记录的最小尺寸护栏 w（防记录值被极端 resize / 误操作污染到退化过小）。
 pub const MIN_MAIN_WIN_W: f32 = 640.0;
@@ -183,7 +183,13 @@ impl AppModel {
     /// 关闭选项卡：干净命名文件夹闭直通 [`Self::remove_tab`]；脏 / 未命名走宿主 glue
     /// （`EditorApp::close_tab`，弹原生确认框异步等待）——本方法只承载「无需询问」路径。
     /// 实际上闭路（弹确认）由宿主 `close_tab` 处理，此处保留 `remove_tab` 本体供两者共用。
-    pub fn remove_tab(&mut self, host: &dyn AppHost, idx: usize, window: &mut Window, cx: &mut App) {
+    pub fn remove_tab(
+        &mut self,
+        host: &dyn AppHost,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         if idx >= self.tabs.len() {
             return;
         }
@@ -420,7 +426,11 @@ impl AppModel {
         // PDF：页 + 页内比例 + 缩放（阅读器自算）。
         if let MediaReader::Pdf(pv) = &tab.payload.reader {
             let (page, frac, zoom) = pv.read(cx).reading_progress()?;
-            return Some(ReadingProgress::Pdf { page_index: page, in_page_frac: frac, zoom });
+            return Some(ReadingProgress::Pdf {
+                page_index: page,
+                in_page_frac: frac,
+                zoom,
+            });
         }
         // EPUB：只读预览宿主（WyEditor）的视口顶源码行。
         if tab.payload.readonly_preview {
@@ -431,7 +441,9 @@ impl AppModel {
         // live2 滚动阅读，源码编辑区被隐藏、顶行停在进入 live 时的陈旧值 → 改读 live2
         // 视口顶源码行（帧未就绪 `None` 时回退源码编辑区），与 `tab_effective_text`
         // 的 live2 口径对齐。
-        let top_line = if tab.live_edit && let Some(l2) = &tab.live2 {
+        let top_line = if tab.live_edit
+            && let Some(l2) = &tab.live2
+        {
             l2.read(cx)
                 .top_source_line()
                 .unwrap_or_else(|| tab.payload.editor.read(cx).viewport_top_line())
@@ -479,7 +491,9 @@ impl AppModel {
         }
         self.reading_progress.insert(key, progress);
         if !host.is_test_build() {
-            reading_progress::save(&Self::reading_progress_path(), &self.reading_progress);
+            // 传 `&mut`：落盘前 `reading_progress::save` 就地剪掉「目标文件已不存在」的过期
+            // 键（表有界，不随历史路径单调膨胀），本 map 与盘面/缓存三方一致。
+            reading_progress::save(&Self::reading_progress_path(), &mut self.reading_progress);
         }
     }
 
@@ -743,11 +757,17 @@ mod tests {
         // 极端小尺寸 → clamp 到最小尺寸护栏（MIN_MAIN_WIN_W×MIN_MAIN_WIN_H）。
         assert_eq!(
             record_main_window_size(&mut m, gpui::size(gpui::px(100.), gpui::px(100.))),
-            Some(gpui::size(gpui::px(MIN_MAIN_WIN_W), gpui::px(MIN_MAIN_WIN_H)))
+            Some(gpui::size(
+                gpui::px(MIN_MAIN_WIN_W),
+                gpui::px(MIN_MAIN_WIN_H)
+            ))
         );
         assert_eq!(
             m.main_window_size,
-            Some(gpui::size(gpui::px(MIN_MAIN_WIN_W), gpui::px(MIN_MAIN_WIN_H)))
+            Some(gpui::size(
+                gpui::px(MIN_MAIN_WIN_W),
+                gpui::px(MIN_MAIN_WIN_H)
+            ))
         );
     }
 }

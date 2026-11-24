@@ -53,25 +53,37 @@ impl PdfViewer {
                 self.reset_x_zoom();
             }
         }
-        // 分页页排（Facing）布局每帧重算：以 zoom=1（fit）口径、**真实阅读视口**算
-        // [`PagedLayout`] 并抄入快照，render 读它做分页定位（显示统一乘 `self.zoom`）。
+        // 分页页排（Facing）布局快照：以 zoom=1（fit）口径、**真实阅读视口**算
+        // [`PagedLayout`] 并抄入，render 读它做分页定位（显示统一乘 `self.zoom`）。
         // 放在 worker/dims 守卫**之前**：无 worker 的测试夹具/纯态期也保持快照新鲜。
         // 连续阅读（`page_tops`/`compute_layout`）与网格（`GridLayout`）为各自布局，
         // 不建分页快照（渲染按 `page_mode` 走对应分支，读不到残留）。
+        // **问题 B**：`paged_layout` 只依赖 (dims, 视口, cols)——滚动不变时结果逐字节相同，
+        // 故对 `paged_layout_cell` 快照加 [`PagedFingerprint`] 指纹：仅在指纹变化时重建，
+        // 纯滚动/静止帧复用上帧快照（不再每帧分配 5×O(rows) 向量）。
         if !self.grid_mode && self.page_mode != PageMode::Continuous && !self.dims.is_empty() {
             let (pvw, pvh) = self.paged_viewport(window);
             // Single 单页模式已删：分页态只剩 Facing（恒 2 列），死支移除。
             let cols = 2;
-            *self.paged_layout_cell.borrow_mut() = Some(paged_layout(
-                &self.dims, pvw, pvh,
-                cols,          // 列数 = 恒 2（Facing 双页）
-                PAGED_GAP_X,   // 水平页间距：同行左页↔右页之间（1px）
-                PAGED_GAP_Y,   // 垂直行间距：上页↔下页之间（6px）
-                PAGE_PAD_X,    // 四周外白（X/Y 取齐 = PAGE_PAD_X，防分页几何不对称）
-            ));
+            let fp = PagedFingerprint::of(&self.dims, pvw, pvh, cols);
+            if self.paged_fingerprint != Some(fp) {
+                *self.paged_layout_cell.borrow_mut() = Some(paged_layout(
+                    &self.dims,
+                    pvw,
+                    pvh,
+                    cols,        // 列数 = 恒 2（Facing 双页）
+                    PAGED_GAP_X, // 水平页间距：同行左页↔右页之间（1px）
+                    PAGED_GAP_Y, // 垂直行间距：上页↔下页之间（6px）
+                    PAGE_PAD_X,  // 四周外白（X/Y 取齐 = PAGE_PAD_X，防分页几何不对称）
+                ));
+                self.paged_fingerprint = Some(fp);
+                self.paged_layout_rebuilds += 1;
+            }
         } else {
-            // 连续/网格/空文档：清掉残留分页快照（模式切换后渲染走连续/网格分支，不读它）。
+            // 连续/网格/空文档：清掉残留分页快照与指纹（模式切换后渲染走连续/网格分支，
+            // 不读它；指纹清空保证再进 Facing 时首帧重建而非误用旧几何）。
             *self.paged_layout_cell.borrow_mut() = None;
+            self.paged_fingerprint = None;
         }
         if self.dims.is_empty() || self.worker.is_none() {
             return;
@@ -165,8 +177,8 @@ impl PdfViewer {
                     .copied()
                     .unwrap_or_else(|| layout.row_height(r))
                     * zoom;
-                let sy = (row_top + frac.clamp(0.0, 1.0) * cell_h)
-                    .clamp(0.0, self.paged_max_scroll());
+                let sy =
+                    (row_top + frac.clamp(0.0, 1.0) * cell_h).clamp(0.0, self.paged_max_scroll());
                 self.scroll.set_offset(gpui::point(px(0.), px(-sy)));
                 self.last_scroll_y = sy;
                 true
@@ -251,15 +263,17 @@ impl PdfViewer {
         // 可见行页区间 ±PAGED_WINDOW_ROWS 行）——连续 `keep_window` 按连续页高 ±MARGIN 选页，
         // 竖排页 + 宽视口下分页行高 ≈ 视口 < 连续页高，可见页会漂出 ±3 连续窗 → 显示页
         // L0/L0.5/走廊/封面全部不被请求、长驻「加载中」（主因 1/2）。非分页/无快照回落连续。
-        let (start, end) = self.paged_schedule_window(scroll_y, viewport_h).unwrap_or_else(|| {
-            keep_window(
-                &self.dims,
-                &self.page_tops,
-                page_width,
-                scroll_y,
-                viewport_h,
-            )
-        });
+        let (start, end) = self
+            .paged_schedule_window(scroll_y, viewport_h)
+            .unwrap_or_else(|| {
+                keep_window(
+                    &self.dims,
+                    &self.page_tops,
+                    page_width,
+                    scroll_y,
+                    viewport_h,
+                )
+            });
 
         // 2.4) **动态瓦片预算 + 钉住集 + R4 均匀降级状态机**（每帧，含静态帧门控早退帧——
         // 门控帧也须推进降级计数/保持钉住状态一致，跳过会让「静态 N 帧」解码停在 0）。
@@ -311,7 +325,9 @@ impl PdfViewer {
             // 廊中心错、给「错的页」派邻居封面白耗栅格预算（主因 1 的走廊侧）。
             let vis_first = self
                 .paged_vis_center(scroll_y, viewport_h)
-                .unwrap_or_else(|| first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y));
+                .unwrap_or_else(|| {
+                    first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y)
+                });
             self.maybe_prefetch_corridor(vis_first, page_width, scale_factor);
             self.ensure_tile_pump(cx);
             // 不更新 `window_sig`/`window_settled`：保持同一静置签名与确认状态。
@@ -556,7 +572,9 @@ impl PdfViewer {
         // A 线：中心页分页下走分页可见中心（与 idle 分支同口径），防深页「给错的页」派廊封面。
         let vis_first = self
             .paged_vis_center(scroll_y, viewport_h)
-            .unwrap_or_else(|| first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y));
+            .unwrap_or_else(|| {
+                first_visible_page(&self.dims, &self.page_tops, page_width, scroll_y)
+            });
         self.evict_prefetch_covers(vis_first);
         self.evict_tiles(start, end, scale_factor);
         // S5 高倍 cover 回收（高倍稳态 1:1 瓦片接管后，cap 截断的 4.0 密度 cover 只是

@@ -32,7 +32,6 @@ use super::{
 };
 
 impl CodeEditor {
-
     /// 测试：对指定逻辑行走真实的 `build_rows` 取数路径，返回该行**最终样式段**
     /// （Markdown 滤镜或 syntect，选区合并前）。用于验证 Markdown WYSIWYG 接线
     /// （`md_mode → scan_window → build_rows → merge_highlights`）。
@@ -367,7 +366,11 @@ impl CodeEditor {
                     }
                 }
             } else {
-                Rc::new(RowContent::materialize(&self.buffer, logical, styles.as_ref()))
+                Rc::new(RowContent::materialize(
+                    &self.buffer,
+                    logical,
+                    styles.as_ref(),
+                ))
             };
             // 选区合并层 + 查找高亮层：选区动态合并（`row_highlight_override`）之上再叠
             // find 匹配底色（当前命中/其余匹配）。find 已关闭或无本行命中 → 不分配。
@@ -380,12 +383,27 @@ impl CodeEditor {
                     hl_override = Some(render::merge_multi_highlights(base, &ov));
                 }
             }
+            // 深横滚快道的宽度索引：已横滚 + 超长行才建/取（停行首 / 短行 None →
+            // `styled_row_text` 走逐字扫描，语义不变；索引跨帧缓存于 `RowWidthCache`）。
+            let widths = (self.hscroll_px() > 0.)
+                .then(|| {
+                    self.row_width_cache.get_or_build(
+                        version,
+                        logical,
+                        content.text.as_ref(),
+                        window,
+                        &self.mono,
+                        self.font_size,
+                    )
+                })
+                .flatten();
             out.push(RowData {
                 highlight_override: hl_override,
                 caret: self.row_caret(window, logical, show_caret),
                 folded: self.row_folded(window, logical),
                 active,
                 content,
+                widths,
             });
         }
         crate::prof::end("ed.build_rows", _t_br);

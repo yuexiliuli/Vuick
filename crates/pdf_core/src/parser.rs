@@ -26,6 +26,7 @@ mod grid;
 mod pdfium;
 mod render;
 mod search;
+mod text_cache;
 mod types;
 mod writeback;
 
@@ -35,15 +36,16 @@ pub use grid::*;
 pub(crate) use pdfium::*;
 pub(crate) use render::*;
 pub use search::*;
+pub(crate) use text_cache::*;
 pub use types::*;
 pub use writeback::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::os::raw::c_int;
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc, OnceLock};
+use std::sync::{Arc, OnceLock, mpsc};
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use pdfium_render::prelude::*;
 
 use crate::recolor::RecolorParams;
@@ -125,7 +127,12 @@ enum WorkerMsg {
     /// （自制 `FPDF_FILEWRITE`，先写同目录临时文件再原子替换 `output_path`）。
     /// 成功回传实际写入的注释条数，并更新内存 bytes（后续操作基于新内容）。
     /// viewer 收到成功后走 Close→Open 同 path 流程重载（见 view 的 modify 相关方法）。
-    Annotate(DocId, Vec<AnnotateItem>, PathBuf, mpsc::Sender<Result<usize>>),
+    Annotate(
+        DocId,
+        Vec<AnnotateItem>,
+        PathBuf,
+        mpsc::Sender<Result<usize>>,
+    ),
     /// 插入空白页并落盘：`at_index` = 新页插入位置（0 基；= page_count 即末尾追加）。
     /// 成功回传**新页数**。
     InsertBlankPage(DocId, usize, f32, f32, PathBuf, mpsc::Sender<Result<usize>>),
@@ -432,9 +439,11 @@ impl PdfWorker {
         zoom_epoch: u64,
     ) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self
-            .tx
-            .send((nav_gen, zoom_epoch, WorkerMsg::RenderPreview(doc_id, req, tx)));
+        let _ = self.tx.send((
+            nav_gen,
+            zoom_epoch,
+            WorkerMsg::RenderPreview(doc_id, req, tx),
+        ));
         rx
     }
 
@@ -468,7 +477,9 @@ impl PdfWorker {
     /// `epoch` = view 侧当前重着色世代号：worker 采纳（镜像）它而非自行计数——开档时序
     /// worker 接线前的多次 set_recolor 经补推折叠成一次消息，靠携带的最终世代对齐（BLOCK）。
     pub fn set_recolor(&self, doc_id: DocId, recolor: Option<RecolorParams>, epoch: u64) {
-        let _ = self.tx.send((0, 0, WorkerMsg::SetRecolor(doc_id, recolor, epoch)));
+        let _ = self
+            .tx
+            .send((0, 0, WorkerMsg::SetRecolor(doc_id, recolor, epoch)));
     }
 
     /// 请求一次**重着色刷新（只刷可见集）**：`keys` = view 侧枚举的「显示槽真实需要的
@@ -483,7 +494,9 @@ impl PdfWorker {
         keys: Vec<RecolorKey>,
     ) -> mpsc::Receiver<RecolorEntry> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, 0, WorkerMsg::RecolorRefresh(doc_id, keys, tx)));
+        let _ = self
+            .tx
+            .send((0, 0, WorkerMsg::RecolorRefresh(doc_id, keys, tx)));
         rx
     }
 
@@ -519,7 +532,9 @@ impl PdfWorker {
     /// 缓存」，见 `grid_band_residency_near_full_mid_low_far_none`）。文档未打开 / 已关闭 → 空。
     pub fn grid_cache_buckets(&self, doc_id: DocId) -> Vec<(usize, u32)> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, 0, WorkerMsg::GridCacheBuckets(doc_id, tx)));
+        let _ = self
+            .tx
+            .send((0, 0, WorkerMsg::GridCacheBuckets(doc_id, tx)));
         rx.recv().unwrap_or_default()
     }
 
@@ -537,9 +552,15 @@ impl PdfWorker {
     /// 请求某页的**光栅图片盒列表**（异步、低优先级，同 Text 不抢栅格化）。
     /// 返回接收结果的通道；文档/页不存在 → `None`，页无图片 → `Some([])`。
     /// 只在点击/右键命中图片时按需调用（懒加载：无交互则零开销）。
-    pub fn page_images(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<Vec<PdfImageBox>>> {
+    pub fn page_images(
+        &self,
+        doc_id: DocId,
+        page: usize,
+    ) -> mpsc::Receiver<Option<Vec<PdfImageBox>>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send((0, 0, WorkerMsg::PageImages(doc_id, page, tx)));
+        let _ = self
+            .tx
+            .send((0, 0, WorkerMsg::PageImages(doc_id, page, tx)));
         rx
     }
 
@@ -554,15 +575,21 @@ impl PdfWorker {
         h: u32,
     ) -> mpsc::Receiver<Option<PdfImagePixels>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self
-            .tx
-            .send((0, 0, WorkerMsg::ImagePixels(doc_id, page, obj_index, w, h, tx)));
+        let _ = self.tx.send((
+            0,
+            0,
+            WorkerMsg::ImagePixels(doc_id, page, obj_index, w, h, tx),
+        ));
         rx
     }
 
     /// 请求文档级检索（异步、低优先级；全页文本层扫描，命中上限 [`SEARCH_MAX_HITS`]）。
     /// 返回接收结果的通道；文档不存在 → `None`。
-    pub fn search(&self, doc_id: DocId, needle: String) -> mpsc::Receiver<Option<PdfSearchResults>> {
+    pub fn search(
+        &self,
+        doc_id: DocId,
+        needle: String,
+    ) -> mpsc::Receiver<Option<PdfSearchResults>> {
         let (tx, rx) = mpsc::channel();
         let _ = self.tx.send((0, 0, WorkerMsg::Search(doc_id, needle, tx)));
         rx
@@ -597,7 +624,11 @@ impl PdfWorker {
     ) -> Result<usize> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, 0, WorkerMsg::InsertBlankPage(doc_id, at_index, width_pt, height_pt, output_path, tx)))
+            .send((
+                0,
+                0,
+                WorkerMsg::InsertBlankPage(doc_id, at_index, width_pt, height_pt, output_path, tx),
+            ))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -648,7 +679,11 @@ impl PdfWorker {
     ) -> Result<MemOpResult> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send((0, 0, WorkerMsg::MemOpInsert(doc_id, at_index, width_pt, height_pt, tx)))
+            .send((
+                0,
+                0,
+                WorkerMsg::MemOpInsert(doc_id, at_index, width_pt, height_pt, tx),
+            ))
             .context("pdfium 工作线程已退出")?;
         rx.recv().context("pdfium 工作线程已退出")?
     }
@@ -798,6 +833,10 @@ impl PdfWorker {
         // 保证检索期间到达的 Render/RenderTile 可以插队先跑——否则一次全量扫描会冻结所有
         // 瓦片/封面（87 页文本 PDF 实测检索 ~440ms，期间渲染被整段堵住 → 随机页先模糊）。
         let mut pending_search: Option<PendingSearch> = None;
+        // worker 侧页文本缓存（search/Text 共用、多查询复用）：`extract_page_text` 每页
+        // LoadPage+Text_LoadPage+每字符多个 FFI，每次查询全量重提取是纯浪费——持久缓存页
+        // 文本、同文档多查询零重提取；`Close` 整档清空（有界 LRU，见 `text_cache` 模块）。
+        let mut page_text_cache = PageTextCache::new();
         // 纸墨重着色参数（**按文档**键控；`Option`：None = 直通）。每次栅格化 return 前经
         // apply_recolor 就地重着色；SetRecolor 在收到当下按 doc_id 写入（见下方 sweep 的
         // match）。进程级单 worker 多阅读器共享 → 绝不能退化成单槽全局值（会跨窗口互相
@@ -854,6 +893,12 @@ impl PdfWorker {
         let mut pending_refresh: Option<PendingRefresh> = None;
         // 各文档最近一次**已完成**刷新所用的参数：worker 端同参短路基准（同参不再重复回传）。
         let mut last_refreshed: HashMap<DocId, Option<RecolorParams>> = HashMap::new();
+        // **当前活跃页对象缓存**（worker 单线程局域，问题 A）：`(doc, page)` → 已
+        // `FPDF_LoadPage` 的 [`PdfPage`]（见 [`render::ActivePage`]）。同页连续渲染多瓦片/
+        // 整页/缩略图复用句柄，消除每 tile 一次 LoadPage/ClosePage 原生往返；页码/文档切换
+        // 自然置换；文档关闭（Close）时先 `clear_doc` 释放缓存页句柄再关文档（防悬空句柄）。
+        // `PdfPage` 不要求 `Send`：本缓存不进跨线程通道、只在 worker 线程局部存活。
+        let mut active_page = render::ActivePage::new();
         loop {
             // 现积压一次性分桶入队（每桶 FIFO；跨类优先序由下方「先取高优先桶」体现）。
             // `SetRecolor`/`RecolorRefresh`/`Navigate` 是控制消息：**当下应用**，不入桶——
@@ -876,13 +921,20 @@ impl PdfWorker {
                         // 缓存已清 → 预熟从新几何中心重扫（旧游标会漏扫；新色按当前带宽窗口
                         // 以新色重熟，窗口内已缓存页跳过）。
                         if let Some(p) = grid_prewarm.as_mut()
-                            && p.doc_id == doc_id {
-                                p.reach = 0;
-                                p.dir = -1;
-                                p.done = false;
-                            }
+                            && p.doc_id == doc_id
+                        {
+                            p.reach = 0;
+                            p.dir = -1;
+                            p.done = false;
+                        }
                     }
-                    WorkerMsg::SetGridPrewarm(doc_id, full_card, quick_card, scale_factor, geom) => {
+                    WorkerMsg::SetGridPrewarm(
+                        doc_id,
+                        full_card,
+                        quick_card,
+                        scale_factor,
+                        geom,
+                    ) => {
                         // 预熟开启/目标/几何更新（「网格在用」显式信号）：进入网格 / 卡宽变化 /
                         // 滚动重定中心时 view 推送全清 + 低清两档目标宽 + 带宽几何（center/window/
                         // near）。分三种：
@@ -946,16 +998,14 @@ impl PdfWorker {
                         let cur = zoom_epoch_mirror.get(&doc_id).copied().unwrap_or(0);
                         zoom_epoch_mirror.insert(doc_id, cur.max(zoom));
                     }
-                    other => {
-                        enqueue_msg(
-                            (n_gen, z_gen, other),
-                            &mut render_q,
-                            &mut mid_q,
-                            &mut thumb_q,
-                            &mut grid_q,
-                            &mut rest_q,
-                        )
-                    }
+                    other => enqueue_msg(
+                        (n_gen, z_gen, other),
+                        &mut render_q,
+                        &mut mid_q,
+                        &mut thumb_q,
+                        &mut grid_q,
+                        &mut rest_q,
+                    ),
                 }
             }
             // 1) 渲染永远最优先：全尺寸 Render / RenderTile（瓦片与整页同为视口内容），
@@ -983,15 +1033,22 @@ impl PdfWorker {
                     }
                 }
                 match msg {
-                     WorkerMsg::Render(doc_id, req, tx) => {
+                    WorkerMsg::Render(doc_id, req, tx) => {
                         let p = recolor.get(&doc_id).copied().flatten();
                         let epoch = recolor_epoch.get(&doc_id).copied().unwrap_or(0); // W1
                         let gpu = crate::recolor::gpu_recolor_gate();
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Cover, gpu))
-                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
+                            .and_then(|doc| {
+                                active_page.get(doc, doc_id, req.page).and_then(|page| {
+                                    render_page(page, req, p, doc_cache, RawKind::Cover, gpu)
+                                })
+                            })
+                            .map(|mut r| {
+                                r.recolor_epoch = epoch;
+                                r
+                            }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     WorkerMsg::RenderPreview(doc_id, req, tx) => {
@@ -1003,8 +1060,15 @@ impl PdfWorker {
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_page(doc, req, p, doc_cache, RawKind::Mid, gpu))
-                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
+                            .and_then(|doc| {
+                                active_page.get(doc, doc_id, req.page).and_then(|page| {
+                                    render_page(page, req, p, doc_cache, RawKind::Mid, gpu)
+                                })
+                            })
+                            .map(|mut r| {
+                                r.recolor_epoch = epoch;
+                                r
+                            }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     WorkerMsg::RenderTile(doc_id, req, tx) => {
@@ -1014,8 +1078,15 @@ impl PdfWorker {
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_tile(doc, req, p, doc_cache, gpu))
-                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
+                            .and_then(|doc| {
+                                active_page
+                                    .get(doc, doc_id, req.page)
+                                    .and_then(|page| render_tile(page, req, p, doc_cache, gpu))
+                            })
+                            .map(|mut r| {
+                                r.recolor_epoch = epoch;
+                                r
+                            }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("render_q 只入 Render/RenderTile/RenderPreview"),
@@ -1047,8 +1118,15 @@ impl PdfWorker {
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_mid(doc, page, sf, p, doc_cache, gpu))
-                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
+                            .and_then(|doc| {
+                                active_page
+                                    .get(doc, doc_id, page)
+                                    .and_then(|pg| render_mid(pg, page, sf, p, doc_cache, gpu))
+                            })
+                            .map(|mut r| {
+                                r.recolor_epoch = epoch;
+                                r
+                            }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("mid_q 只入 Mid"),
@@ -1079,8 +1157,15 @@ impl PdfWorker {
                         let doc_cache = raw_cache.entry(doc_id).or_default();
                         let result = docs
                             .get(&doc_id)
-                            .and_then(|doc| render_thumb(doc, page, p, doc_cache, gpu))
-                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
+                            .and_then(|doc| {
+                                active_page
+                                    .get(doc, doc_id, page)
+                                    .and_then(|pg| render_thumb(pg, page, p, doc_cache, gpu))
+                            })
+                            .map(|mut r| {
+                                r.recolor_epoch = epoch;
+                                r
+                            }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("thumb_q 只入 Thumb"),
@@ -1138,6 +1223,9 @@ impl PdfWorker {
                         let _ = tx.send(result);
                     }
                     WorkerMsg::Close(doc_id) => {
+                        // 问题 A：先释放活跃页缓存句柄（FPDF_ClosePage）再关闭文档
+                        // （FPDF_CloseDocument），防「文档已关、缓存页句柄悬空」的 UAF。
+                        active_page.clear_doc(doc_id);
                         docs.remove(&doc_id);
                         stores.remove(&doc_id);
                         // 重着色按文档键控：关闭即清理（防 doc_id 复用残留旧参数）。
@@ -1153,6 +1241,8 @@ impl PdfWorker {
                         last_refreshed.remove(&doc_id);
                         // 未着色原图缓存随文档一起清理（释放 CPU 内存，防跨文档残留）。
                         raw_cache.remove(&doc_id);
+                        // worker 侧页文本缓存随文档清理（DocId 单调不复用，释放每页文本内存）。
+                        page_text_cache.clear_doc(doc_id);
                         // 网格视图缩略图缓存随文档一起清理（释放内存、防 doc_id 复用残留）。
                         grid_cache.remove(&doc_id);
                         // 预熟随文档关闭一并停（防 doc_id 复用残留旧预熟游标）。
@@ -1160,14 +1250,19 @@ impl PdfWorker {
                             grid_prewarm = None;
                         }
                         // 关闭本应在途的重着色刷新（残留分帧状态会在空 raw 上空转）。
-                        if pending_refresh.as_ref().is_some_and(|pr| pr.doc_id == doc_id) {
+                        if pending_refresh
+                            .as_ref()
+                            .is_some_and(|pr| pr.doc_id == doc_id)
+                        {
                             pending_refresh = None;
                         }
                     }
                     WorkerMsg::Text(doc_id, page, tx) => {
-                        let result = docs
-                            .get(&doc_id)
-                            .and_then(|doc| extract_page_text(doc, page));
+                        // 走 worker 侧页文本缓存（与 search 同池共用）：Text 预取暖搜索、
+                        // 搜索暖预取，同文档内不重复抽取。
+                        let result = docs.get(&doc_id).and_then(|doc| {
+                            cached_page_text(&mut page_text_cache, doc, doc_id, page)
+                        });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::PageImages(doc_id, page, tx) => {
@@ -1177,9 +1272,9 @@ impl PdfWorker {
                         let _ = tx.send(result);
                     }
                     WorkerMsg::ImagePixels(doc_id, page, obj_index, w, h, tx) => {
-                        let result = docs.get(&doc_id).and_then(|doc| {
-                            extract_image_pixels(doc, page, obj_index, w, h)
-                        });
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| extract_image_pixels(doc, page, obj_index, w, h));
                         let _ = tx.send(result);
                     }
                     WorkerMsg::Search(doc_id, needle, tx) => {
@@ -1205,37 +1300,45 @@ impl PdfWorker {
                     }
                     // ---- 写回 / 页操作 / 注释读回（全部 worker 单线程内，见各 handler）----
                     WorkerMsg::Annotate(doc_id, items, out, tx) => {
-                        let result = writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
-                            apply_annotations_raw(b, raw, &items)
-                        });
+                        let result =
+                            writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
+                                apply_annotations_raw(b, raw, &items)
+                            });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::InsertBlankPage(doc_id, at, w, h, out, tx) => {
-                        let result = writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
-                            let page = unsafe { b.FPDFPage_New(raw, at as c_int, w as f64, h as f64) };
-                            if page.is_null() {
-                                return Err(anyhow!("插入空白页失败（at={at} {w:.1}x{h:.1}pt）"));
-                            }
-                            // 新页句柄须 Close 释放（同 FPDF_LoadPage 的对称语义）
-                            unsafe { b.FPDF_ClosePage(page) };
-                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
-                        });
+                        let result =
+                            writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
+                                let page =
+                                    unsafe { b.FPDFPage_New(raw, at as c_int, w as f64, h as f64) };
+                                if page.is_null() {
+                                    return Err(anyhow!(
+                                        "插入空白页失败（at={at} {w:.1}x{h:.1}pt）"
+                                    ));
+                                }
+                                // 新页句柄须 Close 释放（同 FPDF_LoadPage 的对称语义）
+                                unsafe { b.FPDF_ClosePage(page) };
+                                Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                            });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::DeletePage(doc_id, index, out, tx) => {
                         // 越界/单页守卫以**实际待写 bytes**（stores←raw 句柄页数）为准，而非
                         // `docs`（渲染文档可能在连环操作中滞后于 stores，旧计数会误判/漏判）。
-                        let result = writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
-                            let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
-                            if count <= 1 {
-                                return Err(anyhow!("不能删除仅剩的 1 页（当前 {count} 页）"));
-                            }
-                            if index >= count {
-                                return Err(anyhow!("页码越界：删除第 {index} 页（共 {count} 页）"));
-                            }
-                            unsafe { b.FPDFPage_Delete(raw, index as c_int) };
-                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
-                        });
+                        let result =
+                            writeback_edit(&mut stores, &docs, fpdf, doc_id, &out, |b, raw| {
+                                let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                                if count <= 1 {
+                                    return Err(anyhow!("不能删除仅剩的 1 页（当前 {count} 页）"));
+                                }
+                                if index >= count {
+                                    return Err(anyhow!(
+                                        "页码越界：删除第 {index} 页（共 {count} 页）"
+                                    ));
+                                }
+                                unsafe { b.FPDFPage_Delete(raw, index as c_int) };
+                                Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                            });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::ExtractPage(doc_id, index, out, tx) => {
@@ -1280,28 +1383,35 @@ impl PdfWorker {
                     }
                     // 待保存模型：内存级页面操作 / 镜像替换——只改 stores，不写盘。
                     WorkerMsg::MemOpInsert(doc_id, at, w, h, tx) => {
-                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
-                            let page = unsafe { b.FPDFPage_New(raw, at as c_int, w as f64, h as f64) };
-                            if page.is_null() {
-                                return Err(anyhow!("插入空白页失败（at={at} {w:.1}x{h:.1}pt）"));
-                            }
-                            unsafe { b.FPDF_ClosePage(page) };
-                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
-                        });
+                        let result =
+                            writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
+                                let page =
+                                    unsafe { b.FPDFPage_New(raw, at as c_int, w as f64, h as f64) };
+                                if page.is_null() {
+                                    return Err(anyhow!(
+                                        "插入空白页失败（at={at} {w:.1}x{h:.1}pt）"
+                                    ));
+                                }
+                                unsafe { b.FPDF_ClosePage(page) };
+                                Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                            });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::MemOpDelete(doc_id, index, tx) => {
-                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
-                            let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
-                            if count <= 1 {
-                                return Err(anyhow!("不能删除仅剩的 1 页（当前 {count} 页）"));
-                            }
-                            if index >= count {
-                                return Err(anyhow!("页码越界：删除第 {index} 页（共 {count} 页）"));
-                            }
-                            unsafe { b.FPDFPage_Delete(raw, index as c_int) };
-                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
-                        });
+                        let result =
+                            writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
+                                let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                                if count <= 1 {
+                                    return Err(anyhow!("不能删除仅剩的 1 页（当前 {count} 页）"));
+                                }
+                                if index >= count {
+                                    return Err(anyhow!(
+                                        "页码越界：删除第 {index} 页（共 {count} 页）"
+                                    ));
+                                }
+                                unsafe { b.FPDFPage_Delete(raw, index as c_int) };
+                                Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                            });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::MemOpReorder(doc_id, new_order, tx) => {
@@ -1309,35 +1419,41 @@ impl PdfWorker {
                         let _ = tx.send(result);
                     }
                     WorkerMsg::MemOpBatchDelete(doc_id, pages, tx) => {
-                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
-                            let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
-                            // 逐页校验 + 去重（重复项只删一次，不视作错误）。
-                            let mut to_delete: Vec<usize> = Vec::with_capacity(pages.len());
-                            for &p in pages.iter() {
-                                if p >= count {
-                                    return Err(anyhow!("页码越界：批量删除第 {p} 页（共 {count} 页）"));
+                        let result =
+                            writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
+                                let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                                // 逐页校验 + 去重（重复项只删一次，不视作错误）。
+                                let mut to_delete: Vec<usize> = Vec::with_capacity(pages.len());
+                                for &p in pages.iter() {
+                                    if p >= count {
+                                        return Err(anyhow!(
+                                            "页码越界：批量删除第 {p} 页（共 {count} 页）"
+                                        ));
+                                    }
+                                    if !to_delete.contains(&p) {
+                                        to_delete.push(p);
+                                    }
                                 }
-                                if !to_delete.contains(&p) {
-                                    to_delete.push(p);
+                                // 保留至少 1 页（对齐单页删除「不能删除仅剩的 1 页」不变式，
+                                // 防产出 0 页文档）。
+                                if to_delete.len() >= count {
+                                    return Err(anyhow!(
+                                        "批量删除将删光全部 {count} 页（须保留至少 1 页）"
+                                    ));
                                 }
-                            }
-                            // 保留至少 1 页（对齐单页删除「不能删除仅剩的 1 页」不变式，
-                            // 防产出 0 页文档）。
-                            if to_delete.len() >= count {
-                                return Err(anyhow!("批量删除将删光全部 {count} 页（须保留至少 1 页）"));
-                            }
-                            // 按索引降序循环删除：先删高位，低位下标不受已删高位位移影响
-                            // （升序删会因下标位移错删）。
-                            to_delete.sort_unstable_by(|a, b| b.cmp(a));
-                            for &p in to_delete.iter() {
-                                unsafe { b.FPDFPage_Delete(raw, p as c_int) };
-                            }
-                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
-                        });
+                                // 按索引降序循环删除：先删高位，低位下标不受已删高位位移影响
+                                // （升序删会因下标位移错删）。
+                                to_delete.sort_unstable_by(|a, b| b.cmp(a));
+                                for &p in to_delete.iter() {
+                                    unsafe { b.FPDFPage_Delete(raw, p as c_int) };
+                                }
+                                Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                            });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::ExportPages(doc_id, pages, out, tx) => {
-                        let result = export_pages_to_file(&mut stores, &docs, fpdf, doc_id, &pages, &out);
+                        let result =
+                            export_pages_to_file(&mut stores, &docs, fpdf, doc_id, &pages, &out);
                         let _ = tx.send(result);
                     }
                     WorkerMsg::SplitToFile(doc_id, (start, end), out, tx) => {
@@ -1345,47 +1461,48 @@ impl PdfWorker {
                         // `writeback_edit_mem` 骨架（before/after/count + stores 更新）：
                         // `written` 由闭包在文件落盘成功后回填，随 `MemOpResult` 一并返回。
                         let mut written: usize = 0;
-                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
-                            let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
-                            // 严格校验：区间有序、端点 < 页数、剩余 ≥1 页（防 0 页文档）。
-                            if start > end {
-                                return Err(anyhow!("拆分区间起点 {start} 不能大于终点 {end}"));
-                            }
-                            if end >= count {
-                                return Err(
-                                    anyhow!("拆分区间越界：{start}..={end}（共 {count} 页）")
-                                );
-                            }
-                            let len = end - start + 1;
-                            if len >= count {
-                                return Err(anyhow!(
-                                    "拆分将移除全部 {count} 页（须保留至少 1 页）"
-                                ));
-                            }
-                            // ① 区间页按原序（升序连续段）提取落盘——先写文件，失败则整个
-                            //    操作失败、当前文档不变（原子写盘，目标文件不受影响）。
-                            let seq: Vec<usize> = (start..=end).collect();
-                            let dst = new_doc_importing_seq(b, raw, &seq)?;
-                            match unsafe { save_raw_doc_to_file(b, dst, &out) } {
-                                Ok(()) => written = seq.len(),
-                                Err(e) => {
-                                    unsafe { b.FPDF_CloseDocument(dst) };
-                                    return Err(e);
+                        let result =
+                            writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
+                                let count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                                // 严格校验：区间有序、端点 < 页数、剩余 ≥1 页（防 0 页文档）。
+                                if start > end {
+                                    return Err(anyhow!("拆分区间起点 {start} 不能大于终点 {end}"));
                                 }
-                            }
-                            unsafe { b.FPDF_CloseDocument(dst) };
-                            // ② 从当前文档移除该区间：降序删（先删高位，低位下标不受已删
-                            //    高位位移影响——升序删会因下标位移错删）。
-                            let mut idx = end as c_int;
-                            loop {
-                                unsafe { b.FPDFPage_Delete(raw, idx) };
-                                if idx == start as c_int {
-                                    break;
+                                if end >= count {
+                                    return Err(anyhow!(
+                                        "拆分区间越界：{start}..={end}（共 {count} 页）"
+                                    ));
                                 }
-                                idx -= 1;
-                            }
-                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
-                        });
+                                let len = end - start + 1;
+                                if len >= count {
+                                    return Err(anyhow!(
+                                        "拆分将移除全部 {count} 页（须保留至少 1 页）"
+                                    ));
+                                }
+                                // ① 区间页按原序（升序连续段）提取落盘——先写文件，失败则整个
+                                //    操作失败、当前文档不变（原子写盘，目标文件不受影响）。
+                                let seq: Vec<usize> = (start..=end).collect();
+                                let dst = new_doc_importing_seq(b, raw, &seq)?;
+                                match unsafe { save_raw_doc_to_file(b, dst, &out) } {
+                                    Ok(()) => written = seq.len(),
+                                    Err(e) => {
+                                        unsafe { b.FPDF_CloseDocument(dst) };
+                                        return Err(e);
+                                    }
+                                }
+                                unsafe { b.FPDF_CloseDocument(dst) };
+                                // ② 从当前文档移除该区间：降序删（先删高位，低位下标不受已删
+                                //    高位位移影响——升序删会因下标位移错删）。
+                                let mut idx = end as c_int;
+                                loop {
+                                    unsafe { b.FPDFPage_Delete(raw, idx) };
+                                    if idx == start as c_int {
+                                        break;
+                                    }
+                                    idx -= 1;
+                                }
+                                Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                            });
                         let _ = tx.send(result.map(|mem| (written, mem)));
                     }
                     WorkerMsg::MergeFromBytes(doc_id, src_bytes, tx) => {
@@ -1395,37 +1512,40 @@ impl PdfWorker {
                         // 不再阻塞 pdfium 单工作线程；字节经通道切边，view 侧元数据预检 +
                         // 有界读盘后才发此消息）+ `FPDF_ImportPages` 追加。解析失败快速 Err 护栏
                         // （坏字节 → pdfium 快速失败，不 OOM）。
-                        let result = writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
-                            let src_raw = unsafe { load_raw_doc(b, &src_bytes)? };
-                            let src_count = unsafe { b.FPDF_GetPageCount(src_raw) } as usize;
-                            if src_count == 0 {
+                        let result =
+                            writeback_edit_mem(&mut stores, &docs, fpdf, doc_id, |b, raw| {
+                                let src_raw = unsafe { load_raw_doc(b, &src_bytes)? };
+                                let src_count = unsafe { b.FPDF_GetPageCount(src_raw) } as usize;
+                                if src_count == 0 {
+                                    unsafe { b.FPDF_CloseDocument(src_raw) };
+                                    return Err(anyhow!("合并源不含任何页面"));
+                                }
+                                let dst_count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
+                                // 追加：`FPDF_ImportPages` 的 index 是**插入位置**，必须传
+                                // 「目标文档当前页数」才能追加到尾部（传 0 = 插到开头）。
+                                let range = if src_count == 1 {
+                                    "1".to_string()
+                                } else {
+                                    format!("1-{src_count}")
+                                };
+                                let ok = unsafe {
+                                    b.FPDF_ImportPages(raw, src_raw, &range, dst_count as c_int)
+                                };
                                 unsafe { b.FPDF_CloseDocument(src_raw) };
-                                return Err(anyhow!("合并源不含任何页面"));
-                            }
-                            let dst_count = unsafe { b.FPDF_GetPageCount(raw) } as usize;
-                            // 追加：`FPDF_ImportPages` 的 index 是**插入位置**，必须传
-                            // 「目标文档当前页数」才能追加到尾部（传 0 = 插到开头）。
-                            let range = if src_count == 1 {
-                                "1".to_string()
-                            } else {
-                                format!("1-{src_count}")
-                            };
-                            let ok = unsafe {
-                                b.FPDF_ImportPages(raw, src_raw, &range, dst_count as c_int)
-                            };
-                            unsafe { b.FPDF_CloseDocument(src_raw) };
-                            if !b.is_true(ok) {
-                                return Err(anyhow!(
-                                    "合并导入失败（FPDF_GetLastError={}）",
-                                    fpdf_last_error(b)
-                                ));
-                            }
-                            Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
-                        });
+                                if !b.is_true(ok) {
+                                    return Err(anyhow!(
+                                        "合并导入失败（FPDF_GetLastError={}）",
+                                        fpdf_last_error(b)
+                                    ));
+                                }
+                                Ok(unsafe { b.FPDF_GetPageCount(raw) } as usize)
+                            });
                         let _ = tx.send(result);
                     }
                     WorkerMsg::MemRestoreBytes(doc_id, bytes, tx) => {
-                        let result = if let std::collections::hash_map::Entry::Occupied(mut e) = stores.entry(doc_id) {
+                        let result = if let std::collections::hash_map::Entry::Occupied(mut e) =
+                            stores.entry(doc_id)
+                        {
                             e.insert(Arc::new(bytes));
                             Ok(stores.get(&doc_id).map(|b| b.len()).unwrap_or(0))
                         } else {
@@ -1473,7 +1593,9 @@ impl PdfWorker {
                         };
                         let _ = tx.send(result);
                     }
-                    _ => unreachable!("rest_q 只入 Open/Close/Text/PageImages/ImagePixels/Search/写回/页操作/注释读回"),
+                    _ => unreachable!(
+                        "rest_q 只入 Open/Close/Text/PageImages/ImagePixels/Search/写回/页操作/注释读回"
+                    ),
                 }
                 continue;
             }
@@ -1517,7 +1639,10 @@ impl PdfWorker {
                                     gpu,
                                 )
                             })
-                            .map(|mut r| { r.recolor_epoch = epoch; r }); // W1 世代回填
+                            .map(|mut r| {
+                                r.recolor_epoch = epoch;
+                                r
+                            }); // W1 世代回填
                         let _ = tx.send(result);
                     }
                     _ => unreachable!("grid_q 只入 Grid"),
@@ -1527,7 +1652,7 @@ impl PdfWorker {
             // 4) 无渲染/占位/其他积压时，跑一片在途检索再回主循环（新渲染消息可插队）。
             //    每片至多数页/数 ms，因此检索期间的前台渲染冻结有上界，不再拖到全文扫完。
             if let Some(mut ps) = pending_search.take() {
-                search_slice(&mut docs, &mut ps);
+                search_slice(&mut docs, &mut page_text_cache, &mut ps);
                 if ps.is_done() {
                     let _ = ps.tx.send(Some(PdfSearchResults {
                         hits: ps.hits,
@@ -1553,16 +1678,14 @@ impl PdfWorker {
                     // 封面恰是最早写入的最旧条目，最易被挤出 → 刷新对该 key 为空跳过 = **部分
                     // 刷新**（回传 ⊆ 仍驻留缓存的可见集子集），靠下一交互重渲恢复——这是预算
                     // 取舍下的预期行为，不是缺陷（WARN-1 注释 + WARN-2 专项测试钉死）。
-                    let raw = raw_cache
-                        .get(&pr.doc_id)
-                        .and_then(|v| {
-                            v.iter().find(|e| {
-                                e.kind == key.kind
-                                    && e.page == key.page
-                                    && e.row == key.row
-                                    && e.col == key.col
-                            })
-                        });
+                    let raw = raw_cache.get(&pr.doc_id).and_then(|v| {
+                        v.iter().find(|e| {
+                            e.kind == key.kind
+                                && e.page == key.page
+                                && e.row == key.row
+                                && e.col == key.col
+                        })
+                    });
                     match raw {
                         Some(raw) => {
                             let cost = raw.bgra.len() as i64;
@@ -1623,7 +1746,8 @@ impl PdfWorker {
             if let Some((pre_doc_id, pre_full, pre_quick, pre_scale, geom, reach, dir, done)) =
                 prewarm_snap
             {
-                let Some(page_count) = docs.get(&pre_doc_id).map(|d| d.pages().len() as usize) else {
+                let Some(page_count) = docs.get(&pre_doc_id).map(|d| d.pages().len() as usize)
+                else {
                     // 预熟文档已关闭（正常应经 Close 清 prewarm，这里兜底防 race）。
                     grid_prewarm = None;
                     continue;
@@ -1672,7 +1796,9 @@ impl PdfWorker {
                             continue; // 窗口外（一侧越界；另一侧由 max_reach 覆盖继续扫）
                         }
                         let in_near = cand >= near_lo && cand <= near_hi;
-                        has_full = cache.iter().any(|e| e.page == cand && e.bucket_px == full_bucket);
+                        has_full = cache
+                            .iter()
+                            .any(|e| e.page == cand && e.bucket_px == full_bucket);
                         has_quick = cache
                             .iter()
                             .any(|e| e.page == cand && e.bucket_px == quick_bucket);
@@ -1709,10 +1835,11 @@ impl PdfWorker {
                         }
                         // 无论 render 成功与否都推进扫描：失败（页无法渲染）不卡死预熟循环。
                         if let Some(pre) = grid_prewarm.as_mut()
-                            && pre.doc_id == pre_doc_id {
-                                pre.reach = scan.0;
-                                pre.dir = scan.1;
-                            }
+                            && pre.doc_id == pre_doc_id
+                        {
+                            pre.reach = scan.0;
+                            pre.dir = scan.1;
+                        }
                         continue; // 回主循环查队列（真实消息到达即抢占）
                     }
                     // 理论不可达（while 循环要么 finish 要么定位 pending）：兜底置 idle。
@@ -1737,11 +1864,12 @@ impl PdfWorker {
                     grid_cache.remove(&doc_id);
                     // 同 sweep：缓存已清 → 预熟从新几何中心重扫（当前带宽窗口内已缓存页跳过）。
                     if let Some(p) = grid_prewarm.as_mut()
-                        && p.doc_id == doc_id {
-                            p.reach = 0;
-                            p.dir = -1;
-                            p.done = false;
-                        }
+                        && p.doc_id == doc_id
+                    {
+                        p.reach = 0;
+                        p.dir = -1;
+                        p.done = false;
+                    }
                 }
                 Ok((
                     _gen,

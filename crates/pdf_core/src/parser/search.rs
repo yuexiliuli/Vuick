@@ -12,7 +12,7 @@ use std::sync::mpsc;
 
 use pdfium_render::prelude::*;
 
-use super::{DocId, PageText, extract_page_text};
+use super::{DocId, PageText, PageTextCache, cached_page_text};
 
 /// 一次文档级检索的命中：页号 + 页内**原始字符区间**（`[start, end)`，与
 /// [`PageText::chars`](PageText) 下标一致）+ 就地生成的**上下文片段**
@@ -111,10 +111,10 @@ impl PendingSearch {
     }
 }
 
-/// 单页检索：把该页命中合并进 `hits`；已达上限置 `truncated` 并停止追加。页无效/无文本 → 无命中。
+/// 单页检索：把该页命中合并进 `hits`；已达上限置 `truncated` 并停止追加。页文本缺失 → 无命中。
 fn search_one_page_into(
-    doc: &PdfDocument<'_>,
     page_ix: usize,
+    text: &PageText,
     needle: &[char],
     hits: &mut Vec<PdfSearchHit>,
     truncated: &mut bool,
@@ -122,11 +122,8 @@ fn search_one_page_into(
     if *truncated {
         return;
     }
-    let Some(text) = extract_page_text(doc, page_ix) else {
-        return;
-    };
-    for (s, e) in search_page_text(&text, needle) {
-        let snippet = crate::pdf::layout::search_snippet(&text, s, e, SEARCH_SNIPPET_CTX);
+    for (s, e) in search_page_text(text, needle) {
+        let snippet = crate::pdf::layout::search_snippet(text, s, e, SEARCH_SNIPPET_CTX);
         hits.push(PdfSearchHit {
             page: page_ix,
             start: s,
@@ -142,9 +139,15 @@ fn search_one_page_into(
 
 /// 主循环调用的“一片检索”：最多扫 [`SEARCH_SLICE_PAGES`] 页、耗时不超过
 /// [`SEARCH_SLICE_TIMEOUT`]，随后返回让其它消息处理。文档被 Close → 置为结束。
+/// 页文本经 worker 侧缓存 [`cached_page_text`] 取：同文档多查询复用，第二次起不重提取
+/// （`extract_page_text` 的 LoadPage/Text_LoadPage/每字符 FFI 是每查询全量重付的大头）。
 ///
 /// 跨簇可见性（模块重组）：根 `run` 调用 → 升 `pub(crate)`。
-pub(crate) fn search_slice(docs: &mut HashMap<DocId, PdfDocument<'_>>, ps: &mut PendingSearch) {
+pub(crate) fn search_slice(
+    docs: &mut HashMap<DocId, PdfDocument<'_>>,
+    cache: &mut PageTextCache,
+    ps: &mut PendingSearch,
+) {
     let start = std::time::Instant::now();
     for _ in 0..SEARCH_SLICE_PAGES {
         if ps.is_done() || start.elapsed() > SEARCH_SLICE_TIMEOUT {
@@ -152,7 +155,15 @@ pub(crate) fn search_slice(docs: &mut HashMap<DocId, PdfDocument<'_>>, ps: &mut 
         }
         match docs.get(&ps.doc_id) {
             Some(doc) => {
-                search_one_page_into(doc, ps.next_page, &ps.needle, &mut ps.hits, &mut ps.truncated);
+                if let Some(text) = cached_page_text(cache, doc, ps.doc_id, ps.next_page) {
+                    search_one_page_into(
+                        ps.next_page,
+                        &text,
+                        &ps.needle,
+                        &mut ps.hits,
+                        &mut ps.truncated,
+                    );
+                }
                 ps.next_page += 1;
             }
             None => {

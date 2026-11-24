@@ -139,6 +139,8 @@
                     grid_drag: None,
                     grid_layout_cell: std::cell::RefCell::new(None),
                     paged_layout_cell: std::cell::RefCell::new(None),
+                    paged_fingerprint: None,
+                    paged_layout_rebuilds: 0,
                     grid_hold_on_reload: false,
                 };
                 // 先滚到文档中段（纵向负偏移），作为缩放重锚的基准。⚠️ 须落在新布局
@@ -407,6 +409,8 @@
                     grid_drag: None,
                     grid_layout_cell: std::cell::RefCell::new(None),
                     paged_layout_cell: std::cell::RefCell::new(None),
+                    paged_fingerprint: None,
+                    paged_layout_rebuilds: 0,
                     grid_hold_on_reload: false,
                 }
             })
@@ -580,6 +584,8 @@
                     grid_drag: None,
                     grid_layout_cell: std::cell::RefCell::new(None),
                     paged_layout_cell: std::cell::RefCell::new(None),
+                    paged_fingerprint: None,
+                    paged_layout_rebuilds: 0,
                     grid_hold_on_reload: false,
                 };
                 // 先给出「静置已确认」状态，验证变更会复位它（触发一帧收集重着色结果并重绘），
@@ -752,6 +758,8 @@
             grid_drag: None,
             grid_layout_cell: std::cell::RefCell::new(None),
             paged_layout_cell: std::cell::RefCell::new(None),
+            paged_fingerprint: None,
+            paged_layout_rebuilds: 0,
             grid_hold_on_reload: false,
         }
     }
@@ -2198,6 +2206,81 @@
                 "第二行单页应在 cell_rect(2)"
             );
         }
+    }
+
+    /// 问题 B 守门测试：Facing 分页快照**只在布局输入变化时重建**——同视口静止帧复用
+    /// 上帧快照（`paged_layout_rebuilds` 零增长）；resize 改变视口 → 指纹变化 → 重建一次。
+    /// 判别式（K201/K173 防假绿）：撤掉 ensure.rs 的指纹门（每帧无条件 `paged_layout`，
+    /// 即改回问题 B 前的行为）→ 同视口静止帧 `paged_layout_rebuilds` 也增长 → 本测试红。
+    /// 「resize 后必重建」又证明 ensure_window 真在跑（本测试非空转）。
+    #[gpui::test]
+    async fn paged_layout_rebuilds_only_on_fingerprint_change(cx: &mut TestAppContext) {
+        let (holder, cx) = open_paged_host_pages(cx, vec![(793.0, 1123.0); 3]);
+        cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().update(cx, |v, cx| {
+                v.set_page_mode(PageMode::Facing, cx);
+            });
+        });
+        // 等 Facing 首帧重建 + 视口/滚动容器几何落定。
+        for _ in 0..4 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let settled = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .paged_layout_rebuilds
+        });
+        assert!(
+            settled >= 1,
+            "Facing 首帧应至少重建一次分页快照（含 None→Some 分支），实际 {settled}"
+        );
+        // 同视口静止帧：指纹不变 → 复用上帧快照，零重建（问题 B 核心断言）。
+        for _ in 0..6 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let still = cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .paged_layout_rebuilds
+        });
+        let fp_before =
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).paged_fingerprint);
+        assert_eq!(
+            still, settled,
+            "同视口静止帧不应重建分页布局（问题 B：纯滚动/静止零重建），{settled} -> {still}"
+        );
+        // 视口变化（resize）：指纹变 → 必须重建（判别式：非空转测试）。
+        // resize 驱动的 scroll bounds 布局可能滞后 1-2 帧，轮询到计数增长为止。
+        cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(900.)));
+        let mut resized = still;
+        let mut fp_after = fp_before;
+        for _ in 0..12 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+            (resized, fp_after) = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.paged_layout_rebuilds, v.paged_fingerprint)
+            });
+            if resized > still {
+                break;
+            }
+        }
+        assert!(
+            fp_before != fp_after,
+            "resize 后指纹应变化（判别式：确保视口真的变了）：before={fp_before:?} after={fp_after:?}"
+        );
+        assert!(
+            resized > still,
+            "视口 resize 后指纹变化应触发一次重建（判别式：非空转），{still} -> {resized}"
+        );
     }
 
     /// 连续模式回归：page_mode=Continuous → 走既有 `render_pdf_pages`（每页左 0、宽

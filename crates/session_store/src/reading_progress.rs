@@ -44,7 +44,11 @@ impl ReadingProgress {
             ReadingProgress::Epub { top_line } => {
                 json!({ "kind": "epub", "top_line": top_line })
             }
-            ReadingProgress::Pdf { page_index, in_page_frac, zoom } => json!({
+            ReadingProgress::Pdf {
+                page_index,
+                in_page_frac,
+                zoom,
+            } => json!({
                 "kind": "pdf",
                 "page_index": page_index,
                 "in_page_frac": in_page_frac,
@@ -76,7 +80,11 @@ impl ReadingProgress {
                 {
                     return None;
                 }
-                Some(ReadingProgress::Pdf { page_index, in_page_frac, zoom })
+                Some(ReadingProgress::Pdf {
+                    page_index,
+                    in_page_frac,
+                    zoom,
+                })
             }
             _ => None,
         }
@@ -127,18 +135,38 @@ fn store(progress_path: &Path) -> PathKeyJsonStore<HashMap<String, ReadingProgre
     )
 }
 
-/// 从磁盘加载整份阅读进度（`progress_path` 缺失 / JSON 损坏 → 空 map）。
-pub fn load(progress_path: &Path) -> HashMap<String, ReadingProgress> {
-    store(progress_path).load()
+/// 剪掉「目标文件已不存在」的过期路径键（键是规范化/绝对路径、含 `\\?\` 前缀，
+/// `std::fs::metadata` 可直接探测），使持久化表不随历史打开路径单调膨胀——此前只有
+/// insert、无删除路径，旧文件键只增不减（根因：消费方 `reading_progress` map 无
+/// remove/retain/clear）。
+/// 代价：每键一次 `fs::metadata` 同步 syscall——只在 flush（防抖 300ms / 关 tab / 退出
+/// 兜底）与启动加载时执行，**非逐帧热路径**，量级可接受；map 越大 prune 收益越大。
+fn prune_stale_keys(map: &mut HashMap<String, ReadingProgress>) {
+    map.retain(|key, _| std::fs::metadata(Path::new(key)).is_ok());
 }
 
-/// 取整份阅读进度（进程级缓存一次读盘；`save` 更新缓存保证进程内一致）。
+/// 从磁盘加载整份阅读进度（`progress_path` 缺失 / JSON 损坏 → 空 map）；**加载即剪枝**：
+/// 目标文件已不存在的过期键当场移除（消费方内存 map 同步；落盘面到下一次 `save` 收缩）。
+pub fn load(progress_path: &Path) -> HashMap<String, ReadingProgress> {
+    let mut map = store(progress_path).load();
+    prune_stale_keys(&mut map);
+    map
+}
+
+/// 取整份阅读进度（进程级缓存一次读盘；`save` 更新缓存保证进程内一致）；同 [`Self::load`]
+/// 剪枝过期键。
 pub fn load_cached(progress_path: &Path) -> HashMap<String, ReadingProgress> {
-    store(progress_path).load_cached()
+    let mut map = store(progress_path).load_cached();
+    prune_stale_keys(&mut map);
+    map
 }
 
 /// 原子落盘整份阅读进度；A4：先写好盘面再回写缓存（缓存镜像盘面，失败不更新）。
-pub fn save(progress_path: &Path, map: &HashMap<String, ReadingProgress>) {
+/// **落盘前就地剪枝**：目标文件已不存在的过期键先移出 `map` 再写，令表长期有界——调用方
+/// 内存 map 被同步修剪，与盘面、缓存三方一致（消费方 actions.rs 经 `&mut self.reading_progress`
+/// 传入）。
+pub fn save(progress_path: &Path, map: &mut HashMap<String, ReadingProgress>) {
+    prune_stale_keys(map);
     store(progress_path).save(map);
 }
 
@@ -170,7 +198,11 @@ mod tests {
         );
         map.insert(
             "D:\\a\\doc.pdf".into(),
-            ReadingProgress::Pdf { page_index: 7, in_page_frac: 0.5, zoom: 1.5 },
+            ReadingProgress::Pdf {
+                page_index: 7,
+                in_page_frac: 0.5,
+                zoom: 1.5,
+            },
         );
         let json = to_json(&map);
         assert_eq!(from_json(&json), map, "往返应一致");
@@ -208,22 +240,27 @@ mod tests {
         }
         // 不存在路径 fallback 原样。
         let missing = PathBuf::from("Z:\\nonexistent\\missing\\.txt");
-        assert_eq!(normalize_key(&missing), missing.to_string_lossy().into_owned());
+        assert_eq!(
+            normalize_key(&missing),
+            missing.to_string_lossy().into_owned()
+        );
     }
 
     #[test]
     fn save_load_roundtrip_on_disk() {
         let path = tmp_path("disk");
+        // 键须指向真实存在的临时文件：`load`/`save` 会剪掉「目标文件不存在」的过期键
+        // （防历史路径只增不减），假路径键会被剪成空（见 stale_keys_pruned_on_load）。
+        let real = tmp_path("disk-key");
+        std::fs::write(&real, "x").unwrap();
+        let key = normalize_key(&real);
         let mut map = HashMap::new();
-        map.insert(
-            "C:\\x.md".into(),
-            ReadingProgress::Markdown { top_line: 88 },
-        );
-        save(&path, &map);
+        map.insert(key, ReadingProgress::Markdown { top_line: 88 });
+        save(&path, &mut map);
         assert_eq!(load(&path), map, "落盘后应原样读回");
 
         // 清空盘面 → 空 map。
-        save(&path, &HashMap::new());
+        save(&path, &mut HashMap::new());
         assert!(load(&path).is_empty(), "空 map 落盘读回应为空");
 
         // 缺失 / 损坏 JSON → 空 map。
@@ -233,25 +270,119 @@ mod tests {
         assert!(load(&path).is_empty(), "损坏 JSON 应安全回退空 map");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&missing);
+        let _ = std::fs::remove_file(&real);
     }
 
     #[test]
     fn load_cached_misses_on_path_change() {
         let path_a = tmp_path("cache-a");
         let path_b = tmp_path("cache-b");
-        save(&path_a, &HashMap::from([("K".into(), ReadingProgress::Markdown { top_line: 1 })]));
-        save(&path_b, &HashMap::from([("K".into(), ReadingProgress::Markdown { top_line: 2 })]));
+        // 键须是真实存在的临时文件（假键会被剪枝成空 map，缓存用例读不到值）。
+        let fa = tmp_path("cache-key-a");
+        let fb = tmp_path("cache-key-b");
+        std::fs::write(&fa, "a").unwrap();
+        std::fs::write(&fb, "b").unwrap();
+        let ka = normalize_key(&fa);
+        let kb = normalize_key(&fb);
+        let mut ma = HashMap::from([(ka.clone(), ReadingProgress::Markdown { top_line: 1 })]);
+        let mut mb = HashMap::from([(kb.clone(), ReadingProgress::Markdown { top_line: 2 })]);
+        save(&path_a, &mut ma);
+        save(&path_b, &mut mb);
         // 首次读 A 缓存；换路径 B 不应复用 A 的盘面。
         assert_eq!(
-            load_cached(&path_a)["K"],
+            load_cached(&path_a)[&ka],
             ReadingProgress::Markdown { top_line: 1 }
         );
         assert_eq!(
-            load_cached(&path_b)["K"],
+            load_cached(&path_b)[&kb],
             ReadingProgress::Markdown { top_line: 2 },
             "缓存条目带路径守卫：换路径须重读盘面"
         );
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);
+        let _ = std::fs::remove_file(&fa);
+        let _ = std::fs::remove_file(&fb);
+    }
+
+    /// 守门（红→绿）：已删除文件的进度键在下一次加载 / 落盘后被移除，表不再随历史路径
+    /// 单调膨胀。撤销 `prune_stale_keys` 的调用 → `load`/`save` 仍保留全部键 = 红。
+    #[test]
+    fn stale_keys_pruned_on_load() {
+        let path = tmp_path("prune-load");
+        let alive = tmp_path("prune-alive");
+        std::fs::write(&alive, "x").unwrap();
+        let doomed = tmp_path("prune-doomed");
+        std::fs::write(&doomed, "x").unwrap();
+
+        let alive_key = normalize_key(&alive);
+        let doomed_key = normalize_key(&doomed);
+        let ghost = "Z:\\ghost\\never-existed.md";
+
+        let mut map = HashMap::new();
+        map.insert(alive_key.clone(), ReadingProgress::Markdown { top_line: 1 });
+        map.insert(
+            doomed_key.clone(),
+            ReadingProgress::Markdown { top_line: 2 },
+        );
+        map.insert(ghost.into(), ReadingProgress::Markdown { top_line: 3 });
+        save(&path, &mut map);
+
+        // 落盘后删除 doomed 文件 → 重载应只剩 alive。
+        std::fs::remove_file(&doomed).unwrap();
+        let loaded = load(&path);
+        assert!(loaded.contains_key(&alive_key), "仍存在的文件键应保留");
+        assert!(
+            !loaded.contains_key(&doomed_key),
+            "已删文件的键应在加载时移除"
+        );
+        assert!(
+            !loaded.contains_key(ghost),
+            "从未存在的路径键应在加载时移除"
+        );
+        assert_eq!(loaded.len(), 1, "表不随历史键膨胀：只剩存在文件");
+
+        // 盘面同步收缩：再落盘一次后盘上也不含已删键。
+        let mut cur = load_cached(&path);
+        save(&path, &mut cur);
+        let on_disk = load(&path);
+        assert_eq!(on_disk.len(), 1, "落盘面与内存一致（无已删键）");
+        assert!(on_disk.contains_key(&alive_key));
+
+        let _ = std::fs::remove_file(&alive);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 守门（红→绿）：`save` 就地剪枝过期键并令表有界（1 个真实文件键 + 100 个不存在键
+    /// → 落盘后仅剩 1）。撤销 `prune_stale_keys` 调用 → `map.len()==101` = 红。
+    #[test]
+    fn save_prunes_stale_keys_and_bounds_table() {
+        let path = tmp_path("prune-save");
+        let alive = tmp_path("prune-save-alive");
+        std::fs::write(&alive, "x").unwrap();
+        let alive_key = normalize_key(&alive);
+
+        let mut map = HashMap::new();
+        map.insert(alive_key.clone(), ReadingProgress::Markdown { top_line: 5 });
+        for i in 0..100 {
+            map.insert(
+                format!("Z:\\ghost-{i}.md"),
+                ReadingProgress::Markdown { top_line: i },
+            );
+        }
+        save(&path, &mut map);
+        assert_eq!(
+            map.len(),
+            1,
+            "save 应就地把过期键剪掉（调用方内存 map 同步）"
+        );
+        let loaded = load(&path);
+        assert_eq!(loaded.len(), 1, "落盘表有界：只保留仍存在的文件");
+        assert_eq!(
+            loaded[&alive_key],
+            ReadingProgress::Markdown { top_line: 5 }
+        );
+
+        let _ = std::fs::remove_file(&alive);
+        let _ = std::fs::remove_file(&path);
     }
 }

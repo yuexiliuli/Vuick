@@ -18,8 +18,8 @@ use pdfium_render::prelude::*;
 use crate::recolor::{RecolorParams, apply_recolor};
 
 use super::{
-    DocId, RawEntry, RawKind, RecolorEntry, RecolorKey, RenderRequest, RenderResult,
-    TileRequest, TileResult, cache_raw, raw_cache_budget,
+    DocId, RawEntry, RawKind, RecolorEntry, RecolorKey, RenderRequest, RenderResult, TileRequest,
+    TileResult, cache_raw, raw_cache_budget,
 };
 
 /// 是否开启 worker 渲染计时日志（`VUICK_PDF_TIMING=1`）：打印每次瓦片/整页渲染的
@@ -220,6 +220,68 @@ pub(crate) fn start_recolor_refresh(
     });
 }
 
+/// worker 线程局部的「当前活跃页」缓存：持有最近一次渲染用过的 `(doc, page)` 的
+/// [`PdfPage`]，同键连续渲染（单页多瓦片 / 整页 / 缩略图）复用同一个已 `FPDF_LoadPage`
+/// 的页句柄，消除每 tile 一次 `LoadPage`/`ClosePage` 原生往返（高缩放下单页 30-98 tiles，
+/// 问题 A）。仅 worker 单线程持有（`run` 局域变量，不进跨线程通道），`PdfPage` 不要求
+/// `Send`。文档/页码切换自然置换（旧页在此 Drop 关句柄）；文档关闭前由
+/// [`Self::clear_doc`] 先释放缓存页句柄（ClosePage 先于 CloseDocument，防悬空句柄）。
+pub(crate) struct ActivePage<'a> {
+    /// 当前缓存页的 `(doc_id, page)` 键；`(0, 0)` 且 `page = None` 表示空槽。
+    key: (DocId, usize),
+    page: Option<PdfPage<'a>>,
+}
+
+/// 问题 A 守门计数：`ActivePage` 实际调用 `pages().get`（= `FPDF_LoadPage`）的次数。
+/// 仅 `cfg(test)` 统计（生产零成本）；守门测试断言「同页 K 个 tile 只 LoadPage 一次」：
+/// 快照前后 delta == 1（撤掉本缓存回到「每 tile 一次 get」→ delta == K → 红）。
+#[cfg(test)]
+static ACTIVE_PAGE_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 读 [`ACTIVE_PAGE_LOADS`]（问题 A 守门测试探针）。
+#[cfg(test)]
+pub(crate) fn active_page_loads() -> u64 {
+    ACTIVE_PAGE_LOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl<'a> ActivePage<'a> {
+    /// 空槽（首取必装载）。
+    pub(crate) fn new() -> Self {
+        Self {
+            key: (0, 0),
+            page: None,
+        }
+    }
+
+    /// 取 `(doc, page)` 的页对象：同键直接复用缓存句柄（此时 `doc` 不参与装载）；
+    /// 未中则 `pages().get` 装载并置换（旧页 Drop 关句柄）。返回 `None` 仅当 pdfium
+    /// 装载失败——与旧「每 tile 一次 `pages().get`」的失败语义一致（同键持续 None）。
+    pub(crate) fn get(
+        &mut self,
+        doc: &PdfDocument<'a>,
+        doc_id: DocId,
+        page: usize,
+    ) -> Option<&PdfPage<'a>> {
+        if self.key != (doc_id, page) {
+            self.page = doc.pages().get(page as i32).ok();
+            self.key = (doc_id, page);
+            #[cfg(test)]
+            ACTIVE_PAGE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.page.as_ref()
+    }
+
+    /// 文档关闭前释放其缓存页句柄：先 `FPDF_ClosePage`（Drop）再让调用方
+    /// `FPDF_CloseDocument`，否则文档已关后缓存页句柄悬空，末次 Drop 在悬空句柄上
+    /// 调 ClosePage（UAF）。doc_id 不匹配（缓存的是别的文档页）时零操作。
+    pub(crate) fn clear_doc(&mut self, doc_id: DocId) {
+        if self.key.0 == doc_id {
+            self.page = None;
+            self.key = (0, 0);
+        }
+    }
+}
+
 /// 在工作线程内：把单个页面栅格化，返回**紧凑 BGRA** 像素 + 尺寸。
 ///
 /// 关键优化：pdfium 渲染的 bitmap 原生就是 BGRA（`PdfBitmapFormat::BGRA`，stride 恒为
@@ -227,17 +289,19 @@ pub(crate) fn start_recolor_refresh(
 /// 直接 `as_raw_bytes()` 拷出即可，**零像素循环、零字节重排**。旧的
 /// `as_image()` → `into_rgba8()` 会对每像素做 BGRA→RGBA 再一次 RGBA→BGRA 的浪费。
 ///
+/// 页对象由调用方（worker 的 [`ActivePage`] 缓存）预取后传入，本函数**不再自行
+/// `pages().get`**（消除每 tile / 每次整页一次 `FPDF_LoadPage`——问题 A）。
+///
 /// 跨簇可见性（模块重组）：根 `run`（Render/RenderPreview/Mid/Thumb 出口）与
 /// `grid::render_grid`（Thumb 语义复用）调用 → 升 `pub(crate)`。
 pub(crate) fn render_page(
-    doc: &PdfDocument<'_>,
+    page: &PdfPage<'_>,
     req: RenderRequest,
     recolor: Option<RecolorParams>,
     cache: &mut Vec<RawEntry>,
     kind: RawKind,
     gpu: bool,
 ) -> Option<RenderResult> {
-    let page = doc.pages().get(req.page as i32).ok()?;
     let (pw, ph) = (page.width().value, page.height().value);
     // 与 view 侧 `layout::page_bitmap_size` 共用同一套取整（含 1:1 稳定化）：位图宽必须
     // 与显示矩形（设备像素取整）逐纹素一致，否则 GPU 双线性重采样发糊。
@@ -307,19 +371,25 @@ pub(crate) fn render_page(
 ///
 /// 跨簇可见性（模块重组）：根 `run`（RenderTile 出口）调用 → 升 `pub(crate)`。
 pub(crate) fn render_tile(
-    doc: &PdfDocument<'_>,
+    page: &PdfPage<'_>,
     req: TileRequest,
     recolor: Option<RecolorParams>,
     cache: &mut Vec<RawEntry>,
     gpu: bool,
 ) -> Option<TileResult> {
     let t0 = std::time::Instant::now();
-    let page = doc.pages().get(req.page as i32).ok()?;
+    // 页对象由 worker 的 ActivePage 缓存预取传入——命中时 `get_page` 计时≈0，
+    // 不命中（换页）时才在本入口之前发生一次 FPDF_LoadPage。无逐 tile 往返。
     let t_get = std::time::Instant::now();
     let (pw, ph) = (page.width().value, page.height().value);
     let bmp = crate::pdf::layout::page_bitmap_size((pw, ph), req.scale);
-    let (x0, y0, w, h) =
-        crate::pdf::layout::tile_rect(req.col, req.row, req.tile_size, config::pdf::TILE_BLEED, bmp)?;
+    let (x0, y0, w, h) = crate::pdf::layout::tile_rect(
+        req.col,
+        req.row,
+        req.tile_size,
+        config::pdf::TILE_BLEED,
+        bmp,
+    )?;
     let mut dst = PdfBitmap::empty(w as i32, h as i32, PdfBitmapFormat::BGRA).ok()?;
     let t1 = std::time::Instant::now();
     page.render_into_bitmap_with_config(
@@ -386,19 +456,21 @@ pub(crate) fn render_tile(
 /// 缩放按目标宽度 [`THUMB_WIDTH`](config::pdf::THUMB_WIDTH) 推导并夹在
 /// `[0.1, 1.0]`（防止超大页 / 极小页产生荒谬分辨率）；pdfium 下采样极快（~1ms/张）。
 ///
+/// 页对象由 worker 的 [`ActivePage`] 缓存预取后传入（与 `render_thumb` 一次装载、直通
+/// `render_page`，消除「缩略图函数取一次 + `render_page` 再取一次」的双重 LoadPage）。
+///
 /// 跨簇可见性（模块重组）：根 `run`（Thumb 出口）调用 → 升 `pub(crate)`。
 pub(crate) fn render_thumb(
-    doc: &PdfDocument<'_>,
+    page: &PdfPage<'_>,
     page_index: usize,
     recolor: Option<RecolorParams>,
     cache: &mut Vec<RawEntry>,
     gpu: bool,
 ) -> Option<RenderResult> {
-    let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
     let scale = (config::pdf::THUMB_WIDTH / pw).clamp(0.1, 1.0);
     render_page(
-        doc,
+        page,
         RenderRequest {
             page: page_index,
             scale,
@@ -416,21 +488,23 @@ pub(crate) fn render_thumb(
 /// 并夹在 `[0.1, 1.0]`：DPI>1 的屏上目标宽度随之放大，预览不经 GPU 大倍率上采样、保持锐利
 /// （避免“字体/图像发糊”）。比全清便宜 ~6×，比 260px 缩略图清晰得多（可辨识标题/段落结构）。
 ///
+/// 页对象由 worker 的 [`ActivePage`] 缓存预取后传入（与 `render_thumb` 一次装载、直通
+/// `render_page`，消除「中清函数取一次 + `render_page` 再取一次」的双重 LoadPage）。
+///
 /// 跨簇可见性（模块重组）：根 `run`（Mid 出口）调用 → 升 `pub(crate)`。
 pub(crate) fn render_mid(
-    doc: &PdfDocument<'_>,
+    page: &PdfPage<'_>,
     page_index: usize,
     scale_factor: f32,
     recolor: Option<RecolorParams>,
     cache: &mut Vec<RawEntry>,
     gpu: bool,
 ) -> Option<RenderResult> {
-    let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
     let target_w = config::pdf::MID_WIDTH * scale_factor.max(1.0);
     let scale = (target_w / pw).clamp(0.1, 1.0);
     render_page(
-        doc,
+        page,
         RenderRequest {
             page: page_index,
             scale,

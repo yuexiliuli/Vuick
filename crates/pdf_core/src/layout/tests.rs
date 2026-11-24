@@ -2311,3 +2311,29 @@
             None
         );
     }
+
+    /// 问题 B 指纹纯函数测试：`PagedFingerprint::of` 对「相同输入 → 同指纹」、
+    /// 「视口/列数/页内容任一变化 → 指纹变」，保证 `ensure_window` 的门判可靠。
+    #[test]
+    fn paged_fingerprint_tracks_all_layout_inputs() {
+        let dims = vec![(793.0, 1123.0); 3];
+        let a = PagedFingerprint::of(&dims, 1000.0, 700.0, 2);
+        // 相同输入 → 恒等指纹（Eq 幂等）。
+        assert_eq!(a, PagedFingerprint::of(&dims, 1000.0, 700.0, 2));
+        // 视口任一变 → 指纹变。
+        assert_ne!(a, PagedFingerprint::of(&dims, 1001.0, 700.0, 2));
+        assert_ne!(a, PagedFingerprint::of(&dims, 1000.0, 701.0, 2));
+        // 列数变 → 指纹变。
+        assert_ne!(a, PagedFingerprint::of(&dims, 1000.0, 700.0, 1));
+        // 页内容变（同页数异尺寸）→ 指纹变（reload 后布局必须重建）。
+        let mut dims2 = dims.clone();
+        dims2[1] = (900.0, 1200.0);
+        assert_ne!(a, PagedFingerprint::of(&dims2, 1000.0, 700.0, 2));
+        // 页内容变（页数变）→ 指纹变。
+        assert_ne!(
+            a,
+            PagedFingerprint::of(&vec![(793.0, 1123.0); 4], 1000.0, 700.0, 2)
+        );
+        // 空文档指纹与有页文档必不同（空分支不建快照）。
+        assert_ne!(a, PagedFingerprint::of(&[], 1000.0, 700.0, 2));
+    }

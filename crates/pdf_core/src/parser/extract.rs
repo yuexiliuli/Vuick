@@ -7,7 +7,10 @@
 use anyhow::Result;
 use pdfium_render::prelude::*;
 
-use super::{CharBox, PdfImageBox, PdfImagePixels, PdfTextChar, PageText, PdfWorker, resolve_char_box};
+use super::{
+    CharBox, DocId, PageText, PageTextCache, PdfImageBox, PdfImagePixels, PdfTextChar, PdfWorker,
+    resolve_char_box,
+};
 
 /// 打开文档并取每页 (宽, 高)（PDF 点单位）。dll 路径自动定位（进程级缓存）。
 /// 用进程级单例工作线程完成，避免二次绑定 pdfium。
@@ -27,6 +30,36 @@ fn char_box_from_rect(r: PdfRect) -> CharBox {
     }
 }
 
+/// 守门计数：`extract_page_text` 实际执行 pdfium 页文本抽取（LoadPage + Text_LoadPage +
+/// 每字符盒 FFI）的次数。仅 `cfg(test)`（生产零成本）；守门测试断言「同文档同查询第二次
+/// 复用 worker 侧页文本缓存、零重抽取」：快照前后 delta == 0（撤掉缓存回到「每查询每页
+/// 各抽一次」→ delta == 页数 > 0 → 红）。
+#[cfg(test)]
+static EXTRACT_PAGE_TEXT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 读 [`EXTRACT_PAGE_TEXT_CALLS`]（守门测试探针）。
+#[cfg(test)]
+pub(crate) fn extract_page_text_calls() -> u64 {
+    EXTRACT_PAGE_TEXT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 取页文本：先查 worker 侧页文本缓存（命中零重提取直接复用），未中则 [`extract_page_text`]
+/// 抽取并回填缓存。search 与 Text 预取共用同一池（双向暖心：预取暖搜索、搜索暖预取）。
+/// 页/文档不存在 → `None`（与 [`extract_page_text`] 语义一致；`None` 不入缓存）。
+pub(crate) fn cached_page_text(
+    cache: &mut PageTextCache,
+    doc: &PdfDocument<'_>,
+    doc_id: DocId,
+    page_index: usize,
+) -> Option<PageText> {
+    if let Some(t) = cache.get(doc_id, page_index) {
+        return Some(t.clone());
+    }
+    let text = extract_page_text(doc, page_index)?;
+    cache.insert(doc_id, page_index, text.clone());
+    Some(text)
+}
+
 /// 在工作线程内：抽取单页的完整文本层（Unicode + 每字符包围盒）。
 ///
 /// - 用 [`PdfPageText::chars`](PdfPageText) 遍历 pdfium 文本索引顺序（≈文档内定义顺序，
@@ -36,6 +69,8 @@ fn char_box_from_rect(r: PdfRect) -> CharBox {
 /// - 所有盒夹到页内，保证下游命中测试/高亮不越界。
 /// - 页面无文本（扫描件）返回 `Some(PageText { chars: [] })`；页/文档不存在返回 `None`。
 pub(crate) fn extract_page_text(doc: &PdfDocument<'_>, page_index: usize) -> Option<PageText> {
+    #[cfg(test)]
+    EXTRACT_PAGE_TEXT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let page = doc.pages().get(page_index as i32).ok()?;
     let (page_w, page_h) = (page.width().value, page.height().value);
     let text = page.text().ok()?;
@@ -158,9 +193,10 @@ pub(crate) fn extract_image_pixels(
         .get_processed_bitmap_with_size(doc, w, h)
         .ok()?;
     if (bmp.width() != w || bmp.height() != h)
-        && let Ok(b2) = img.get_processed_bitmap_with_size(doc, w, h) {
-            bmp = b2;
-        }
+        && let Ok(b2) = img.get_processed_bitmap_with_size(doc, w, h)
+    {
+        bmp = b2;
+    }
     let bw = bmp.width();
     let bh = bmp.height();
     if bw <= 0 || bh <= 0 {
@@ -179,7 +215,10 @@ pub(crate) fn extract_image_pixels(
     let mut bgra = Vec::with_capacity(px_count.saturating_mul(4));
     if rgba.len() == px_count * 4 {
         // RGBA → BGRA：交换 R/B 一次（退化为逐 4 字节 flat_map，零分配）。
-        bgra.extend(rgba.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], px[3]]));
+        bgra.extend(
+            rgba.chunks_exact(4)
+                .flat_map(|px| [px[2], px[1], px[0], px[3]]),
+        );
     } else if rgba.len() == px_count {
         // 灰度：单字节 → 三通道同值 + 不透明（DIB 32bpp 必需）。
         bgra.reserve(rgba.len() * 4);
@@ -204,7 +243,11 @@ pub(crate) fn extract_image_pixels(
             .get(bgra.len().saturating_sub(row)..)
             .unwrap_or_default()
             .to_vec();
-        let fill = if last_row.is_empty() { vec![0xff; row] } else { last_row };
+        let fill = if last_row.is_empty() {
+            vec![0xff; row]
+        } else {
+            last_row
+        };
         while bgra.len() + fill.len() <= want {
             bgra.extend_from_slice(&fill);
         }

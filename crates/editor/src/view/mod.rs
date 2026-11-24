@@ -26,10 +26,10 @@ mod input;
 mod render;
 
 mod document;
+mod editing;
+mod interaction;
 mod layout;
 mod rows;
-mod interaction;
-mod editing;
 // 模块级 allow（替代已删的 crate 级 `#![allow(dead_code)]`）：`find_goto.rs` 内唯一
 // 真死符号 = `test_find_tip_state`（pub(crate)，lib 非测试构建无消费点，仅
 // `editor::tests::find` 消费）。该文件是并行评审 agent 在途文件，不逐项改 → dormancy
@@ -40,6 +40,9 @@ mod find_goto;
 pub(crate) use find_goto::{FindBtn, FindTipState};
 
 pub(crate) use render::merge_highlights;
+// 超长行深横滚快道的前缀宽索引类型（RowData 携带、`build_rows` 建/取，见
+// `render::RowCumWidths`；非测试构建有生产消费方，不加 cfg 门控）。
+pub(crate) use render::RowCumWidths;
 // `char_align_highlights` 仅测试经此路径消费（`editor::tests`），非测试构建会触发
 // unused 警告 → 按测试门控（render.rs 内在用法直接引用同模块函数，不受影响）。
 #[cfg(test)]
@@ -69,7 +72,6 @@ use gpui::{
     Window,
 };
 
-use crate::editor::markdown::MarkdownDecor;
 use crate::editor::fold::{
     BracketChar,
     BracketPair,
@@ -77,6 +79,7 @@ use crate::editor::fold::{
     FoldMap,
 };
 use crate::editor::highlight::Highlighter;
+use crate::editor::markdown::MarkdownDecor;
 use crate::editor::undo::{
     UndoManager,
 };
@@ -184,6 +187,10 @@ struct RowData {
     /// 不入缓存，与 `caret`/`folded` 同级——但不受光标闪烁影响（head 位置稳定即
     /// 恒高亮）。折叠优先于本高亮（见 `row_element` 的互斥 `when`）。
     active: bool,
+    /// 超长行深横滚快道的「每字符前缀真实宽」索引（`render::RowCumWidths`，仅超长行
+    /// 且已横滚时 `build_rows` 建/取，`Rc` 浅复用跨帧共享）。`None` = 短行/未建 →
+    /// `styled_row_text` 回落逐字扫描（语义不变）。
+    widths: Option<Rc<RowCumWidths>>,
 }
 
 impl RowData {
@@ -208,6 +215,7 @@ impl RowData {
             caret: None,
             folded: None,
             active: false,
+            widths: None,
         }
     }
 }
@@ -284,6 +292,67 @@ impl RowCache {
     #[cfg(test)]
     fn stats(&self) -> (usize, usize) {
         (self.hits, self.entries.len())
+    }
+}
+
+/// 超长行「每字符前缀真实宽」索引缓存（深横滚窗口化的宽度来源，见
+/// `render::RowCumWidths`）。键 = `(buffer.version(), 逻辑行)`，失效与 [`RowCache`]
+/// 同源（编辑 +1 / 整篇替换显式 clear）——宽度只随行文本变化；**字体/字号变化**
+/// （`refresh_metrics` 指纹变）由显式 clear 作废（宽度与字形挂钩，与 `RowCache` 的
+/// 「内容字形无关」语义正交，故二者独立缓存、不共享失效）。
+///
+/// 值 = 该行前缀宽索引（`Rc` 浅复用）；仅在「横滚中 + 超过
+/// [`render::LONG_LINE_HVIEW_MIN_CHARS`]」时建/取（短行/停行首零构建）。有界 FIFO
+/// 封顶防大文档一路横滚把缓存涨到 O(全文)（同 [`RowCache::CAP`] 的访问近似单调）。
+#[derive(Default)]
+struct RowWidthCache {
+    entries: HashMap<(u64, usize), Rc<RowCumWidths>>,
+    order: VecDeque<(u64, usize)>,
+}
+
+impl RowWidthCache {
+    // 每索引约 8B/字符（f32 前缀宽 + u32 字节偏移）；超长行单索引可达数百 KB~数 MB。
+    // CAP 设小 + FIFO 最旧淘汰：防大文档一路横滚把缓存涨到 O(全文)级内存。
+    const CAP: usize = 64;
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    /// 取或建某逻辑行的前缀宽索引。短行 / 空行 / 全零宽行 / 超 4GiB 行 → `None`
+    /// （不建）。首次为某 (version, row) 建 = O(字符数) 一次（摊销），此后每帧
+    /// O(1) Rc 命中。
+    fn get_or_build(
+        &mut self,
+        version: u64,
+        row: usize,
+        text: &str,
+        window: &mut Window,
+        mono: &SharedString,
+        font_size: Pixels,
+    ) -> Option<Rc<RowCumWidths>> {
+        if let Some(v) = self.entries.get(&(version, row)) {
+            return Some(v.clone());
+        }
+        if text.len() <= render::LONG_LINE_HVIEW_MIN_CHARS {
+            return None;
+        }
+        let built = render::build_row_cum_widths_real(text, mono, font_size, window)?;
+        if built.cum.len() <= 1 {
+            return None; // 空 / 全零宽行无需索引
+        }
+        let v = Rc::new(built);
+        if !self.entries.contains_key(&(version, row)) {
+            self.order.push_back((version, row));
+        }
+        self.entries.insert((version, row), v.clone());
+        while self.entries.len() > Self::CAP
+            && let Some(old) = self.order.pop_front()
+        {
+            self.entries.remove(&old);
+        }
+        Some(v)
     }
 }
 
@@ -391,6 +460,9 @@ pub struct CodeEditor {
     /// （文本 + 合并后样式）。滚动帧只物化新进窗口的行；编辑/撤销/重做靠版本键失效，
     /// 整篇替换由 [`Self::reset_document`] 显式清空。见 [`RowCache`]。
     row_cache: RowCache,
+    /// 超长行「每字符前缀真实宽」索引缓存（深横滚窗口化快道的宽度来源，见
+    /// [`RowWidthCache`]）；字体/字号变化与整篇替换显式清空。
+    row_width_cache: RowWidthCache,
     /// Markdown「所见即所得」滤镜：.md 时替代 syntect 行高亮，把记号画淡、正文
     /// 应用加粗/斜体/代码/链接/标题等富样式（只改样式，文本/光标/选区不变）。
     md_decor: MarkdownDecor,
@@ -618,8 +690,12 @@ impl CodeEditor {
     /// `[start, end)`（表按 `(line, col)` 升序 ⇒ 同行字符连续一段）。无 → 空 range。
     /// `build_rows` 用它按行 O(log n) 二分取出该行括号字符做前景覆色；无括号行零分配。
     fn bracket_chars_on_line(&self, logical: usize) -> std::ops::Range<usize> {
-        let start = self.bracket_char_depths.partition_point(|c| c.line < logical);
-        let end = self.bracket_char_depths.partition_point(|c| c.line <= logical);
+        let start = self
+            .bracket_char_depths
+            .partition_point(|c| c.line < logical);
+        let end = self
+            .bracket_char_depths
+            .partition_point(|c| c.line <= logical);
         start..end
     }
 
@@ -782,7 +858,8 @@ impl CodeEditor {
 
     /// 测试用：光标所在宽度单位列（与横向 reveal 相同口径）。
     pub fn test_caret_units(&self) -> usize {
-        self.buffer.unit_column(self.selection.head().min(self.buffer.len()))
+        self.buffer
+            .unit_column(self.selection.head().min(self.buffer.len()))
     }
 
     /// 测试探针（`cfg(test)`）：当前光标焦点态 `caret.focused`（失焦 = 光标停闪）。
@@ -817,6 +894,7 @@ impl CodeEditor {
             char_width,
             &self.mono,
             self.font_size,
+            None,
             window,
         )
         .map(|w| (w.bytes, w.offset_px))

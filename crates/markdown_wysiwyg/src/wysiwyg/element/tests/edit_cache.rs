@@ -176,11 +176,13 @@ fn typing_dollar_at_math_upper_bound_keeps_regions_consistent(cx: &mut TestAppCo
     });
 }
 
-/// M5-B3-1 回归（1b）：Enter 落在 `$$ … $$` 块**内部**（跨线区域，内容/边界变）→
-/// 增量平移失败 → 整篇重建（`regions_ver++`）。断言重建后 derived 与从零重扫一致
-/// （块被拆成两行 body、`source` 用 `\n` 重拼）。
+/// M5-B3-1 回归（1b，2026-11-24 行为升级）：Enter 落在 `$$ … $$` 块**内部**（跨线区域）
+/// 旧实现「增量平移失败 → 整篇重建（`regions_ver++`）」；新增保「局部重扫回填」：编辑
+/// 窗口无新 `$$` 围栏、闭围栏未被吞 → 就地重拼 `source` + 区间平移，`regions_ver` 不变、
+/// `derived` Rc 复用。断言局部结果与从零重扫一致（块被拆成两行 body、`source` 用 `\n`
+/// 重拼）——这是增量路径与整篇重建的**对拍正确性判据**。
 #[gpui::test]
-fn enter_inside_math_block_rebuilds_and_stays_consistent(cx: &mut TestAppContext) {
+fn enter_inside_math_block_stays_incremental_and_consistent(cx: &mut TestAppContext) {
     use crate::markdown::parse::inline_style;
     use gpui::App;
     cx.update(crate::test_support::bind_local_keymaps);
@@ -194,14 +196,20 @@ fn enter_inside_math_block_rebuilds_and_stays_consistent(cx: &mut TestAppContext
         let ed = host.read(cx).ed.clone();
         let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         assert_eq!(ed.read(cx).derived().borrow().math_regions.len(), 1);
+        let rc0 = ed.read(cx).derived();
+        drop(rc0.borrow());
         // 在 body 行中段按 Enter（结构编辑跨区域）。
         let at = ed.read(cx).content().find("\\int_a").unwrap() + 4;
         let v0 = ed.read(cx).regions_ver();
         ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
         assert_eq!(
             ed.read(cx).regions_ver(),
-            v0.wrapping_add(1),
-            "块内 Enter 应整篇重建"
+            v0,
+            "块内 Enter 应走局部重扫回填（regions_ver 不递增）"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(&rc0, &ed.read(cx).derived()),
+            "块内 Enter 应复用 derived Rc（不整篇重建）"
         );
         let new_text = ed.read(cx).content();
         let expect = inline_style::math_regions(&new_text);
@@ -665,6 +673,193 @@ fn code_parse_ready_rehighlights_identical_duplicate_blocks(cx: &mut TestAppCont
         assert_eq!(
             r2, 2,
             "两个相同代码块副本都应被重排上色（旧全局键/旧单块作废只会上一个），实际 {r2}"
+        );
+    });
+}
+
+/// M5-B3-1 增补守门（红→绿）：**块内 Enter（结构编辑落在 `$$…$$` 块 body 内部）**不再
+/// 整篇重建——`derived()` 不 `text_shared()` 物化全文 + 不三表全扫（~17ms@6MB 的逐键
+/// 尖峰，即「块内回车卡顿」）。旧实现（`shift_derived_after_edit` 对「编辑线落在区域内」
+/// 一律返回 false）→ `regions_ver++` → 下帧 `derived()` 从全文重扫 → 本测试对
+/// `text_shared_calls()` 计数与 `regions_ver` 的断言即红。新实现局部重扫回填 → 计数/
+/// 版本不变 → 绿；并断言局部重扫结果与全文重扫逐字段一致（`derived` Rc 就地修补）。
+/// ~1MB：顶部一个大 `$$…$$` 块 + 大量普通填充行——帧只取小 band（derived 是内容级，
+/// 与 band 无关），首次 warm 帧把全文派生扫进缓存、计数基线在其后取。
+#[gpui::test]
+fn math_block_interior_enter_stays_incremental(cx: &mut TestAppContext) {
+    use crate::markdown::parse::inline_style;
+    use gpui::App;
+    cx.update(crate::test_support::bind_local_keymaps);
+    let mut text = String::from("$$\n");
+    for i in 0..200 {
+        text.push_str(&format!("\\int_a^{i} x dx + \\alpha_{i}\n"));
+    }
+    text.push_str("$$\n");
+    while text.len() < 1_000_000 {
+        text.push_str("ordinary para filler line with some more words to fill size here\n");
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // warm：小 band 也会建全文 derived（内容级），计数基线在其后。
+        let _f0 = build_frame(ed.read(cx), window, px(900.), (0., 900.));
+        let at = ed.read(cx).content().find("\\int_a^100").unwrap() + 3;
+        let v0 = ed.read(cx).regions_ver();
+        let c0 = ed.read(cx).doc().text_shared_calls();
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+        let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 900.));
+        let c1 = ed.read(cx).doc().text_shared_calls();
+        assert_eq!(c1, c0, "块内 Enter 不得触发全文 text_shared（应局部重扫回填）");
+        assert_eq!(ed.read(cx).regions_ver(), v0, "块内 Enter 不得递增 regions_ver");
+        // 一致性：局部结果 == 全文重扫。
+        let new_text = ed.read(cx).content();
+        let expect = inline_style::math_regions(&new_text);
+        let d = ed.read(cx).derived();
+        let d = d.borrow();
+        assert_eq!(d.math_regions.len(), expect.len(), "块内 Enter 后区域数应一致");
+        for (g, e) in d.math_regions.iter().zip(expect.iter()) {
+            assert_eq!(g.range, e.range, "行区间应一致");
+            assert_eq!(g.source, e.source, "source 应重拼（拆行含 \\n）");
+            assert_eq!(g.align, e.align, "align 应一致");
+        }
+        assert_eq!(
+            d.math_regions[0].range, 0usize..203,
+            "Enter 拆行后巨块仍 0..203 行"
+        );
+        assert!(
+            d.math_regions[0].source.contains('\n'),
+            "Enter 拆行后 source 应含 \\n"
+        );
+    });
+}
+
+/// M5-B3-1 增补守门：**警报（callout）body 内结构编辑**（Enter + 中部跨行合并）——同样
+/// 局部重扫回填、不整篇重建；局部结果与全文重扫一致（`alert_fold_regions` 区间平移 +
+/// `alert_region_kinds` 键平移 + 折叠态保留）。
+#[gpui::test]
+fn alert_interior_structural_edit_stays_incremental(cx: &mut TestAppContext) {
+    use crate::markdown::parse::inline_style;
+    use gpui::App;
+    cx.update(crate::test_support::bind_local_keymaps);
+    let text = "> [!NOTE]- 甲\n> body A\n> body B\n> body C\n尾\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert_eq!(ed.read(cx).derived().borrow().alert_fold_regions.len(), 1);
+        // ① body 中部跨行合并：删 `\n> body B` 前导换行 → body B 并入 body A。
+        let at = ed.read(cx).content().find("\n> body B").unwrap();
+        let v0 = ed.read(cx).regions_ver();
+        let c0 = ed.read(cx).doc().text_shared_calls();
+        ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "", ecx));
+        let _f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let c1 = ed.read(cx).doc().text_shared_calls();
+        assert_eq!(c1, c0, "callout body 合并不得整篇 text_shared");
+        assert_eq!(ed.read(cx).regions_ver(), v0, "body 合并不得递增 regions_ver");
+        let new_text = ed.read(cx).content();
+        let expect = inline_style::alert_regions(&new_text);
+        let d = ed.read(cx).derived();
+        let d = d.borrow();
+        assert_eq!(
+            d.alert_fold_regions.len(),
+            expect.iter().filter(|(_, _, f)| f.is_some()).count(),
+            "可折叠 callout 数应不变"
+        );
+        // 区域 [0,4) → [0,3)，折叠态保留 true。
+        assert_eq!(d.alert_fold_regions, vec![(0usize..3, true)], "body 合并后区间平移");
+        // kinds 键覆盖 marker + 新 body 行（0..3）。
+        for l in 0..3 {
+            assert!(
+                d.alert_region_kinds.contains_key(&l),
+                "callout body 合并后 kinds 应仍覆盖行 {l}"
+            );
+        }
+        assert!(!d.alert_region_kinds.contains_key(&3), "行 3（尾）不应再是 callout");
+        // 释放 derived 借用（增量路径 regions_ver 不变 = 同一 Rc 就地修补；持有借用跨
+        // 编辑会撞 RefCell 双借——生产无外部持有，仅测试需显式 drop）。
+        drop(d);
+        // ② Enter：body 行内换行带 WYSIWYG 的 `> ` 自动续引（否则新行丢失 `>` 前缀 →
+        // 区域缩水 → 合法整建，不属于本增量路径）。编辑偏移先用 content() 算好（其本身
+        // 会 text_shared，基线须在其后取）。
+        let at2 = ed.read(cx).content().find("> body A> body B").unwrap() + 5;
+        let v1 = ed.read(cx).regions_ver();
+        let c2 = ed.read(cx).doc().text_shared_calls();
+        ed.update(cx, |e, ecx| e.replace_range(at2..at2, "\n> ", ecx));
+        let _f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert_eq!(ed.read(cx).doc().text_shared_calls(), c2, "callout body Enter 不得整篇 text_shared");
+        assert_eq!(ed.read(cx).regions_ver(), v1, "callout body Enter 不得递增 regions_ver");
+        let n2 = ed.read(cx).content();
+        let expect2 = inline_style::alert_regions(&n2);
+        let d2 = ed.read(cx).derived();
+        let d2 = d2.borrow();
+        assert_eq!(
+            d2.alert_fold_regions,
+            expect2.iter().filter_map(|(r, _, f)| f.map(|f| (r.clone(), f))).collect::<Vec<_>>(),
+            "Enter 后 callout 区间应等于全文重扫"
+        );
+    });
+}
+
+/// M5-B3-1 增补守门：**标题折叠体内部结构编辑**（Enter + 中部跨行合并）——局部重扫回填、
+/// 不整篇重建；`heading_fold_bodies` 区间平移、折叠态保持、与全文重扫一致。
+#[gpui::test]
+fn heading_interior_structural_edit_stays_incremental(cx: &mut TestAppContext) {
+    use crate::markdown::parse::inline_style;
+    use gpui::App;
+    cx.update(crate::test_support::bind_local_keymaps);
+    let text = "## App\nbody A\nbody B\nbody C\n# Tail\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, ecx| e.toggle_heading_fold_at_line(0, ecx));
+        let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert_eq!(ed.read(cx).derived().borrow().heading_fold_bodies, vec![0usize..4]);
+        // ① body 中部跨行合并：删 `\nbody B` 前导换行 → body B 并入 body A。
+        let at = ed.read(cx).content().find("\nbody B").unwrap();
+        let v0 = ed.read(cx).regions_ver();
+        let c0 = ed.read(cx).doc().text_shared_calls();
+        ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "", ecx));
+        let _f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let c1 = ed.read(cx).doc().text_shared_calls();
+        assert_eq!(c1, c0, "折叠体 body 合并不得整篇 text_shared");
+        assert_eq!(ed.read(cx).regions_ver(), v0, "body 合并不得递增 regions_ver");
+        assert_eq!(
+            ed.read(cx).derived().borrow().heading_fold_bodies,
+            vec![0usize..3],
+            "body 合并后折叠体 [0,4) → [0,3)"
+        );
+        // ② Enter：body 行内再插入换行 → 仍局部。（编辑偏移先用 content() 算好——
+        // content() 本身会 text_shared，基线须在其后取。）
+        let at3 = ed.read(cx).content().find("body Abody B").unwrap() + 5;
+        let v1 = ed.read(cx).regions_ver();
+        let c2 = ed.read(cx).doc().text_shared_calls();
+        ed.update(cx, |e, ecx| e.replace_range(at3..at3, "\n", ecx));
+        let _f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert_eq!(ed.read(cx).doc().text_shared_calls(), c2, "折叠体 body Enter 不得整篇 text_shared");
+        assert_eq!(ed.read(cx).regions_ver(), v1, "折叠体 body Enter 不得递增 regions_ver");
+        let n3 = ed.read(cx).content();
+        let expect3 = inline_style::heading_fold_regions(&n3, &{
+            use std::collections::HashSet;
+            let mut s = HashSet::new();
+            s.insert("## App".to_string());
+            s
+        });
+        assert_eq!(
+            ed.read(cx).derived().borrow().heading_fold_bodies,
+            expect3,
+            "Enter 后折叠体应等于全文重扫"
         );
     });
 }

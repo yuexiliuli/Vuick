@@ -207,6 +207,44 @@ impl PagedLayout {
     }
 }
 
+/// 分页布局的**指纹**（问题 B）：由 [`paged_layout`] 的全部输入压实而成，供
+/// `view::ensure_window` 判断「上帧分页快照是否仍可用」——纯滚动/静止帧输入不变 →
+/// 复用上帧快照，跳过每帧 5×O(rows) 的向量分配与几何重算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedFingerprint {
+    /// `pages.len()`（页数；页数变了必重建，快路径）。
+    pub dims_len: usize,
+    /// `pages` 内容压实的 64 位哈希（FNV-1a over 每页 (w,h) 的 `f32::to_bits`）——
+    /// 页数相同但尺寸变化（如页操作 reload 后同页数异尺寸）也能检出。
+    pub dims_hash: u64,
+    /// 分页视口宽/高的 bit 表示（`f32::to_bits` 逐位比较，避免浮点近似把「微变」放行）。
+    pub viewport_w_bits: u32,
+    pub viewport_h_bits: u32,
+    /// 列数（当前恒 2 = Facing；保留进指纹防未来列数可变化时漏重建）。
+    pub cols: usize,
+}
+
+impl PagedFingerprint {
+    /// 由布局输入压实（纯 u64/u32 归并，无分配）：`pages` 逐页 (w,h) 的
+    /// `f32::to_bits` 混入 FNV-1a，`viewport_w/h` 与 `cols` 直接并入尾项。
+    pub fn of(pages: &[(f32, f32)], viewport_w: f32, viewport_h: f32, cols: usize) -> Self {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &(w, hh) in pages {
+            h ^= w.to_bits() as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            h ^= hh.to_bits() as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Self {
+            dims_len: pages.len(),
+            dims_hash: h,
+            viewport_w_bits: viewport_w.to_bits(),
+            viewport_h_bits: viewport_h.to_bits(),
+            cols,
+        }
+    }
+}
+
 /// 计算阅读分页布局（纯函数，与 [`grid_layout`] 同姿势）：`pages` 为每页 `(宽, 高)` pt
 /// （只用纵横比），`viewport_w/h` 视口、`cols ∈ {1,2}`（0→1、>2→2）、`h_gap` 水平页间距
 /// （双页同行左页↔右页之间）、`v_gap` 垂直行间距（上页↔下页之间）、`padding` 四周外白。

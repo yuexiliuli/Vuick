@@ -48,7 +48,6 @@
 // 本文件未直接消费的导入（已迁往子模块的职责）由 allow 放行，不做裁剪。
 // PDF 视图状态树类型较长 → 放行
 #![allow(clippy::type_complexity)]
-
 #![allow(unused_imports)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -175,12 +174,12 @@ pub(crate) enum UndoEntry {
 }
 
 use crate::pdf::layout::{
-    GridLayout, PagedLayout, Slot, TileSlot, advance_match_index, bitmap_display_scales,
-    column_left, compute_layout, content_to_local, cover_affordable, cover_scale, display_height,
-    first_visible_page, grid_layout, grid_zoom_limits_for_cols, hit_char, keep_window, local_to_pt,
-    min_ar, page_bitmap_size, page_segment_text, paged_layout, paged_layout_scaled, paged_render_window,
-    pt_to_local, render_scale, selection_spans_pt, visible_tile_range_axis, zoom_rescroll_anchor,
-    zoom_rescroll_anchor_paged,
+    GridLayout, PagedFingerprint, PagedLayout, Slot, TileSlot, advance_match_index,
+    bitmap_display_scales, column_left, compute_layout, content_to_local, cover_affordable,
+    cover_scale, display_height, first_visible_page, grid_layout, grid_zoom_limits_for_cols,
+    hit_char, keep_window, local_to_pt, min_ar, page_bitmap_size, page_segment_text, paged_layout,
+    paged_layout_scaled, paged_render_window, pt_to_local, render_scale, selection_spans_pt,
+    visible_tile_range_axis, zoom_rescroll_anchor, zoom_rescroll_anchor_paged,
 };
 use crate::pdf::parser::PDF_MERGE_MAX_SRC_BYTES;
 use crate::pdf::{
@@ -191,8 +190,8 @@ use crate::pdf::{
 use config::pdf::{
     COVER_INFLIGHT, GRID_MBAND_ROWS, GRID_NBAND_ROWS, IMAGE_CACHE_PAGES, IMAGE_INFLIGHT,
     JUMP_PAGES_THRESHOLD, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES,
-    MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, MOVE_THRESHOLD_VERY_RATIO, PAGED_GAP_X,
-    PAGED_GAP_Y, PAGE_PAD_X, PAGE_WIDTH, PREFETCH_COVER_MARGIN, PREFETCH_COVER_MARGIN_MAX,
+    MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, MOVE_THRESHOLD_VERY_RATIO, PAGE_PAD_X,
+    PAGE_WIDTH, PAGED_GAP_X, PAGED_GAP_Y, PREFETCH_COVER_MARGIN, PREFETCH_COVER_MARGIN_MAX,
     PREFETCH_RETURN_SIDE_BONUS, STOP_DETECT_FRAMES, STOP_DETECT_PX, TEXT_CACHE_PAGES,
     TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE,
     ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
@@ -235,9 +234,11 @@ fn paged_jump_cover_window(
     let scroll_y_fit = -(scroll_y.max(0.0) / zoom);
     let vh_fit = viewport_h / zoom;
     if let Some((s, e)) = paged_render_window(layout, scroll_y_fit, vh_fit, n, 0)
-        && s <= target && target <= e {
-            return Some((s, e));
-        }
+        && s <= target
+        && target <= e
+    {
+        return Some((s, e));
+    }
     // 退化为目标页所在行的行页区间（首页/末页由 `row_page_start` 区间 + `min(n−1)` 兜底夹回，
     // 尾部半行自动只剩该行实际页数）。
     let cols = layout.cols.max(1);
@@ -991,11 +992,20 @@ pub struct PdfViewer {
     /// 网格布局每帧快照（wave6）：「渲染期写、事件期读」对齐 TabBoundsRecorder 姿势——
     /// render 每帧把 [`GridLayout`] 抄入，`on_drag_move` 事件期读上一帧布局算插入命中。
     pub(crate) grid_layout_cell: std::cell::RefCell<Option<GridLayout>>,
-    /// 分页页排（Facing）布局每帧快照：`ensure_window` 每帧以 zoom=1（fit）口径、
+    /// 分页页排（Facing）布局每帧快照：`ensure_window` 以 zoom=1（fit）口径、
     /// 真实阅读视口重算 [`PagedLayout`] 并抄入，render 期读上一帧布局做分页定位（同
     /// `grid_layout_cell`「渲染期写、render 期读」姿势，下一页排命中/滚动沿用本快照）。
     /// 连续模式 / 网格 / 空文档 → `None`（渲染走连续或网格分支，不读它）。
+    /// **问题 B 指纹门**：`ensure_window` 只在 [`Self::paged_fingerprint`] 变化时重建本
+    /// 快照；纯滚动/静止帧输入不变 → 复用上帧（零 5×O(rows) 向量分配）。
     pub(crate) paged_layout_cell: std::cell::RefCell<Option<PagedLayout>>,
+    /// Facing 分页快照的**指纹**（问题 B）：`Some` = `paged_layout_cell` 按此输入压实而成，
+    /// `None` = 连续/网格/空文档或未算过。`ensure_window` 先比对指纹、只在变化时重建
+    /// 分页快照并更新；连续/网格分支清为 `None`（模式切换后不误复用旧几何）。
+    pub(crate) paged_fingerprint: Option<PagedFingerprint>,
+    /// 问题 B 观测计数：分页快照**实际重建**次数（`ensure_window` 指纹变化分支 +1）。
+    /// 纯回归观测（无副作用）：守门测试断言「同视口静止帧零重建、resize 后必重建」。
+    pub(crate) paged_layout_rebuilds: u64,
     /// 拖拽重排后的 reload 保持网格模式（wave6）：`grid_drag_release` 提交前置位，
     /// [`PdfViewer::apply_loaded`] 消费后清——拖拽重组是网格内操作，reload 不应把用户踢
     /// 回单列（默认 reload 复位到单列语义仅适用非拖拽的普通重载）。

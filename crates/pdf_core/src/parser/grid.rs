@@ -143,7 +143,12 @@ pub(crate) fn grid_cache_evict(cache: &mut Vec<GridEntry>, budget: u64) {
 /// （预算内不逐出、滚动任意方向回看零重渲、空闲预熟整本可补齐）；仅超长文档/病态大卡
 /// 超上界时才走既有 LRU 逐最旧。`page_count` = 当前文档页数、`cur_bytes` = 刚渲染单卡字节。
 fn grid_cache_budget(cache: &[GridEntry], page_count: u64, cur_bytes: u64) -> u64 {
-    let per_card = cache.iter().map(GridEntry::bytes).max().unwrap_or(0).max(cur_bytes);
+    let per_card = cache
+        .iter()
+        .map(GridEntry::bytes)
+        .max()
+        .unwrap_or(0)
+        .max(cur_bytes);
     let full_doc_estimate = page_count
         .saturating_mul(per_card.saturating_mul(5) / 4)
         .min(config::pdf::GRID_CACHE_FULL_DOC_MAX);
@@ -187,12 +192,13 @@ pub(crate) fn render_grid(
         });
     }
     // 未命中：按桶渲染（`&mut vec![]` = 临时空 raw 缓存——`render_page` 对 Thumb 语义
-    // 不入 raw 缓存、不触碰该实参，仅占位口径一致）。
+    // 不入 raw 缓存、不触碰该实参，仅占位口径一致）。`page` 已在上方 `pages().get` 装载
+    // 一次，直通 `render_page`（问题 A：消除「网格取一次 + render_page 再取一次」双重 LoadPage）。
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0);
     let scale = (bucket_px as f32 / pw).clamp(0.1, 1.0);
     let result = render_page(
-        doc,
+        &page,
         RenderRequest {
             page: page_index,
             scale,

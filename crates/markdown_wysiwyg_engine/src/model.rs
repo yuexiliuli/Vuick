@@ -184,7 +184,12 @@ impl HScrollState {
 
     /// 读某 kind 的滚动偏移（缺键 = 0）。
     pub fn scroll_of(&self, k: HScrollKind, src: usize) -> f32 {
-        self.bucket(k).scroll.borrow().get(&src).copied().unwrap_or(0.)
+        self.bucket(k)
+            .scroll
+            .borrow()
+            .get(&src)
+            .copied()
+            .unwrap_or(0.)
     }
 
     /// 写某 kind 的滚动偏移（**唯一 setter 实现**）：`<0` 归一 0，`<=0.01` 删键否则插键。
@@ -276,6 +281,13 @@ pub struct WyRenderModel {
     /// 结构性编辑待消费标志：结构性分支置位、`fold_plan` 消费后清除——防止增量平移
     /// 误用陈旧编辑信息（非结构编辑/宽度变化恰在结构编辑之后、其间无重建时）。
     pub struct_edit_pending: Cell<bool>,
+    /// 结构编辑「局部重扫回填」改动了派生区域**内容/几何**（M5-B3-1 增补）：
+    /// `regions_ver` 不递增（derived Rc 就地修补）时，`fold_plan` 的 deltas **增量平移**
+    /// 前提「区域身份不变、只行号动」被破坏——被编辑区域可能跨多块（未闭合 `$$` 的
+    /// 卡块远离编辑行），平移会留陈旧卡值。置位后 `fold_plan_deltas_shifted` 读到即
+    /// 回退整建（`fold_plan_deltas_full`，O(块数)，远便宜于 `derived` 的 O(N) 全扫），
+    /// 并在读取时清除。
+    pub struct_region_content_changed: Cell<bool>,
     /// 结构编辑「行号平移」版本（M5-B3-1 子项 2/4）：`shift_derived_after_edit` 成功
     /// 就地平移区域行号（结构不变、只是行号动）时递增——纳入 `fp_sets` 缓存键，
     /// 防集合命中旧行号；`regions_ver++` 整篇重建走另一条键分量（`regions_ver`）天然
@@ -410,6 +422,7 @@ impl WyRenderModel {
             struct_blk_old: Cell::new(0),
             struct_blk_span_delta: Cell::new(0),
             struct_edit_pending: Cell::new(false),
+            struct_region_content_changed: Cell::new(false),
             regions_shift_ver: Cell::new(0),
             regions_ver: Cell::new(0),
             fold_plan: RefCell::new(None),

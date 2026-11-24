@@ -17,12 +17,12 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use gpui::{Image, ImageFormat};
 
 use config::limits::{
-    EPUB_MAX_CHAPTER_BYTES, EPUB_MAX_CHAPTER_COUNT, EPUB_MAX_IMAGE_BYTES,
-    EPUB_MAX_IMAGE_COUNT, EPUB_MAX_IMAGE_TOTAL_BYTES, EPUB_MAX_MARKDOWN_BYTES,
+    EPUB_MAX_CHAPTER_BYTES, EPUB_MAX_CHAPTER_COUNT, EPUB_MAX_IMAGE_BYTES, EPUB_MAX_IMAGE_COUNT,
+    EPUB_MAX_IMAGE_TOTAL_BYTES, EPUB_MAX_MARKDOWN_BYTES,
 };
 use config::markdown::EPUB_IMG_SCHEME;
 use markdown::RowAlign;
@@ -282,8 +282,12 @@ fn parse_epub_reader_limited<R: Read + std::io::Seek>(
     }
 
     // 1) 定位 OPF：读 META-INF/container.xml
-    let container_xml = read_zip_entry(&mut archive, "META-INF/container.xml", limits.max_entry_bytes)
-        .context("EPUB 缺少 META-INF/container.xml")?;
+    let container_xml = read_zip_entry(
+        &mut archive,
+        "META-INF/container.xml",
+        limits.max_entry_bytes,
+    )
+    .context("EPUB 缺少 META-INF/container.xml")?;
     let opf_path = find_opf_path(&container_xml)?;
 
     // 2) 读取 OPF：解析 metadata + manifest + spine
@@ -301,7 +305,10 @@ fn parse_epub_reader_limited<R: Read + std::io::Seek>(
     // 3) 按 spine 顺序逐章读取 XHTML → 转 Markdown；图片保留在内存（不落盘）
     let mut markdown = String::new();
     let mut images: HashMap<String, Arc<Image>> = HashMap::new();
+    // 全局脚注表（键经「跨章冲突重编号」后整书唯一）
     let mut notes: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+    // 跨章冲突时顺延分配的「下一个空闲全局脚注号」（随原号保留的号自动越过）
+    let mut note_next_free: usize = 1usize;
     let base_dir = parent_zip_dir(&opf_path);
     // 虚拟 src → 字段/条目的去重（同一 zip 内路径只解码一次进内存）
     let mut img_cache: HashMap<String, String> = HashMap::new();
@@ -359,7 +366,40 @@ fn parse_epub_reader_limited<R: Read + std::io::Seek>(
             img_cache.insert(full, vsrc.clone());
             Some(vsrc)
         };
-        let chapter_md = xhtml_to_markdown(&chapter_html, &mut on_img, &mut notes);
+        // 本章独立脚注表（裸号 → 文本）：`xhtml_to_markdown` 按本章原始裸号登记；
+        // 跨章冲突重编号 + 并入全局表在下一步统一处理（不再 first-wins 丢后章定义）。
+        let mut chapter_notes: std::collections::BTreeMap<usize, String> =
+            std::collections::BTreeMap::new();
+        let chapter_md = xhtml_to_markdown(&chapter_html, &mut on_img, &mut chapter_notes);
+        // 跨章冲突重编号：只对「本章定义了脚注」的裸号做换算——
+        // 与先前章节登记号无冲突的原样保留（全书连续编号的书型行为不变）；
+        // 冲突的（每章独立重新编号的书型）顺延取全局空闲号。纯引用号（其定义在
+        // 其它章节，如全局编号书型正文章引用末尾注释章）保持原号，跨章引用不受影响。
+        // 本章定义与正文引用共用同一张映射，保证 `[^N]`/`[!N]` 与 notes 键一致。
+        let chapter_md = {
+            let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for &local in chapter_notes.keys() {
+                let g = if !notes.contains_key(&local) {
+                    local
+                } else {
+                    while notes.contains_key(&note_next_free) {
+                        note_next_free += 1;
+                    }
+                    let g = note_next_free;
+                    note_next_free += 1;
+                    g
+                };
+                if note_next_free <= g {
+                    note_next_free = g + 1;
+                }
+                map.insert(local, g);
+            }
+            for (local, text) in chapter_notes {
+                let g = *map.get(&local).unwrap_or(&local);
+                notes.entry(g).or_insert(text);
+            }
+            renumber_note_markers(&chapter_md, &|n| *map.get(&n).unwrap_or(&n))
+        };
         if chapter_md.trim().is_empty() {
             continue;
         }
@@ -400,7 +440,9 @@ fn image_format_for_bytes(data: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Bmp)
     } else if data.starts_with(b"<svg")
         || data.starts_with(b"<?xml")
-        || data.get(..128).is_some_and(|s| String::from_utf8_lossy(s).contains("<svg"))
+        || data
+            .get(..128)
+            .is_some_and(|s| String::from_utf8_lossy(s).contains("<svg"))
     {
         Some(ImageFormat::Svg)
     } else if data.starts_with(b"II*\x00") || data.starts_with(b"MM\x00*") {
@@ -470,9 +512,10 @@ fn find_opf_path(container_xml: &str) -> Result<String> {
     for node in doc.descendants() {
         if node.has_tag_name("rootfile")
             && let Some(full) = node.attribute("full-path")
-                && !full.trim().is_empty() {
-                    return Ok(full.trim().to_string());
-                }
+            && !full.trim().is_empty()
+        {
+            return Ok(full.trim().to_string());
+        }
     }
     bail!("container.xml 里找不到 rootfile/full-path")
 }
@@ -503,9 +546,10 @@ fn parse_opf(opf_xml: &str, opf_path: &str) -> Result<(String, String, Vec<Strin
     let mut manifest: std::collections::HashMap<String, String> = Default::default();
     for node in doc.descendants() {
         if node.has_tag_name("item")
-            && let (Some(id), Some(href)) = (node.attribute("id"), node.attribute("href")) {
-                manifest.insert(id.to_string(), href.to_string());
-            }
+            && let (Some(id), Some(href)) = (node.attribute("id"), node.attribute("href"))
+        {
+            manifest.insert(id.to_string(), href.to_string());
+        }
     }
 
     // spine：itemref idref 顺序 = 阅读顺序
@@ -513,13 +557,13 @@ fn parse_opf(opf_xml: &str, opf_path: &str) -> Result<(String, String, Vec<Strin
     for node in doc.descendants() {
         if node.has_tag_name("itemref")
             && let Some(idref) = node.attribute("idref")
-                && let Some(href) = manifest.get(idref) {
-                    // 过滤掉 ncx/封面等非 xhtml 项，只保留章节
-                    if href.ends_with(".html") || href.ends_with(".xhtml") || href.ends_with(".htm")
-                    {
-                        spine_hrefs.push(href.clone());
-                    }
-                }
+            && let Some(href) = manifest.get(idref)
+        {
+            // 过滤掉 ncx/封面等非 xhtml 项，只保留章节
+            if href.ends_with(".html") || href.ends_with(".xhtml") || href.ends_with(".htm") {
+                spine_hrefs.push(href.clone());
+            }
+        }
     }
 
     if spine_hrefs.is_empty() {
@@ -745,9 +789,13 @@ fn walk_body(
     let child_quoted = quoted + usize::from(node.has_tag_name("blockquote"));
     // `float-r` / `float-l` 容器内的段落下移该对齐（也用于取消正文首行缩进）。
     let child_align = if node.has_tag_name("div") {
-        match node.attribute("class").unwrap_or("").split_whitespace().find(|c| {
-            *c == "float-r" || *c == "float-l" || *c == "float-right" || *c == "float-left"
-        }) {
+        match node
+            .attribute("class")
+            .unwrap_or("")
+            .split_whitespace()
+            .find(|c| {
+                *c == "float-r" || *c == "float-l" || *c == "float-right" || *c == "float-left"
+            }) {
             Some("float-r") | Some("float-right") => Some(RowAlign::Right),
             Some("float-l") | Some("float-left") => Some(RowAlign::Left),
             _ => align,
@@ -757,7 +805,15 @@ fn walk_body(
     };
     for child in node.children() {
         if child.is_element() || child.is_text() {
-            walk_body(&child, out, depth + 1, child_quoted, child_align, notes, on_img);
+            walk_body(
+                &child,
+                out,
+                depth + 1,
+                child_quoted,
+                child_align,
+                notes,
+                on_img,
+            );
         }
     }
 }
@@ -797,35 +853,35 @@ fn emit_paragraph(
     let note_def = leading_footnote_id(node).is_some();
     if note_def
         && let Some(first) = segs.iter_mut().find(|s| !s.trim().is_empty())
-        && let Some(rel) = first.find('[') {
-            let after = &first[rel + 1..];
-            let d = after.chars().take_while(|c| c.is_ascii_digit()).count();
-            if d > 0 && after[d..].starts_with(']') {
-                first.insert(rel + 1, '!');
-            }
+        && let Some(rel) = first.find('[')
+    {
+        let after = &first[rel + 1..];
+        let d = after.chars().take_while(|c| c.is_ascii_digit()).count();
+        if d > 0 && after[d..].starts_with(']') {
+            first.insert(rel + 1, '!');
         }
+    }
     let joined = segs.join("\n");
     let t = joined.trim().to_string();
-    if note_def
-        && let Some(n) = leading_footnote_id(node) {
-            // 定义标记已被改写为 `[!N]`（上一段插入 `!`），正文提取要兼容
-            // 改写后的前缀（先 `[!N]`、再回落裸 `[N]`），否则注释表永远为空。
-            let def = format!("[!{n}]");
-            let plain = format!("[{n}]");
-            let rest = t
-                .strip_prefix(def.as_str())
-                .or_else(|| t.strip_prefix(plain.as_str()));
-            if let Some(rest) = rest {
-                notes.entry(n).or_insert_with(|| {
-                    rest.trim_start_matches('\u{3000}').trim().to_string()
-                });
-            }
+    if note_def && let Some(n) = leading_footnote_id(node) {
+        // 定义标记已被改写为 `[!N]`（上一段插入 `!`），正文提取要兼容
+        // 改写后的前缀（先 `[!N]`、再回落裸 `[N]`），否则注释表永远为空。
+        let def = format!("[!{n}]");
+        let plain = format!("[{n}]");
+        let rest = t
+            .strip_prefix(def.as_str())
+            .or_else(|| t.strip_prefix(plain.as_str()));
+        if let Some(rest) = rest {
+            notes
+                .entry(n)
+                .or_insert_with(|| rest.trim_start_matches('\u{3000}').trim().to_string());
         }
+    }
     // 正文（`class="text"` 或空 class、且不在引述块内）首行缩进 2 字符：
     // 行首前置两个全角空格，渲染时折行后天然「首行缩进、次行顶格」；
     // 对齐行（落款/浮段）与引述/注释等段落不缩进。
-    let is_body_text = quoted == 0
-        && (cls.split_whitespace().any(|c| c == "text") || cls.trim().is_empty());
+    let is_body_text =
+        quoted == 0 && (cls.split_whitespace().any(|c| c == "text") || cls.trim().is_empty());
     for seg in segs.into_iter().map(|s| s.trim().to_string()) {
         if seg.is_empty() {
             continue;
@@ -867,7 +923,11 @@ fn emit_list_item(
             }
             None => t,
         };
-        let marker = if parent_is_ordered(node) { "- " } else { "• " };
+        let marker = if parent_is_ordered(node) {
+            "- "
+        } else {
+            "• "
+        };
         out.push_str(marker);
         out.push_str(&quote_prefix(&line, quoted));
         out.push('\n');
@@ -908,11 +968,19 @@ fn emit_image(
     }
     match on_img(&src, &alt) {
         Some(path) => {
-            let alt_esc = if alt.is_empty() { "图片".to_string() } else { alt.clone() };
+            let alt_esc = if alt.is_empty() {
+                "图片".to_string()
+            } else {
+                alt.clone()
+            };
             out.push_str(&format!("\n\n![{alt_esc}]({path})\n\n"));
         }
         None => {
-            let label = if alt.is_empty() { "图片".to_string() } else { alt.clone() };
+            let label = if alt.is_empty() {
+                "图片".to_string()
+            } else {
+                alt.clone()
+            };
             out.push_str(&format!("\n\n> [图片：{label}]\n\n"));
         }
     }
@@ -938,7 +1006,9 @@ fn align_directive(a: RowAlign) -> &'static str {
 
 /// 「注释」段落的 leading 脚注锚 id：`footnoteN` → `N`（无则 `None`）。
 fn leading_footnote_id(node: &roxmltree::Node) -> Option<usize> {
-    let a = node.children().find(|c| c.is_element() && c.has_tag_name("a"))?;
+    let a = node
+        .children()
+        .find(|c| c.is_element() && c.has_tag_name("a"))?;
     let id = a.attribute("id")?;
     id.strip_prefix("footnote")?.parse().ok()
 }
@@ -952,6 +1022,52 @@ fn note_ref_number(href: &str) -> Option<usize> {
     } else {
         digits.parse().ok()
     }
+}
+
+/// 找出 `s` 里全部脚注标记（正文引用 `[^N]` / 注释定义 `[!N]`）的字节区间与裸号。
+/// 返回 `(起始字节, 结束字节(不含,含 `]`), 裸号)`；`s[start..end]` 即整个标记。
+/// 非脚注方括号 / 多字节字符按字符边界跳过（防切在多字节 UTF-8 中间）。
+fn note_marker_ranges(s: &str) -> Vec<(usize, usize, usize)> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] == b'[' && (b[i + 1] == b'^' || b[i + 1] == b'!') {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 2 && j < b.len() && b[j] == b']' {
+                let local: usize = s[i + 2..j].parse().unwrap_or(0);
+                out.push((i, j + 1, local));
+                i = j + 1;
+                continue;
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 把 `s` 里全部脚注标记的裸号按 `renumber` 换算后改写（只换数字，标记形态
+/// `[^N]`/`[!N]` 保持不变）。映射表没覆盖的号原样保留；无标记时直接返回原串。
+fn renumber_note_markers(s: &str, renumber: &dyn Fn(usize) -> usize) -> String {
+    let marks = note_marker_ranges(s);
+    if marks.is_empty() {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut prev = 0usize;
+    for (start, end, local) in marks {
+        out.push_str(&s[prev..start]);
+        out.push_str(&s[start..start + 2]); // `[^` 或 `[!`
+        out.push_str(&renumber(local).to_string());
+        out.push(']');
+        prev = end;
+    }
+    out.push_str(&s[prev..]);
+    out
 }
 
 /// 给引述层级加 `>` 前缀的辅助：每行前加对应数量 `> `。
@@ -968,9 +1084,10 @@ fn node_text(node: &roxmltree::Node) -> String {
     let mut s = String::new();
     for n in node.descendants() {
         if n.is_text()
-            && let Some(t) = n.text() {
-                s.push_str(t);
-            }
+            && let Some(t) = n.text()
+        {
+            s.push_str(t);
+        }
     }
     s
 }
@@ -991,10 +1108,11 @@ fn node_text_epub(node: &roxmltree::Node, depth: usize) -> String {
             }
         } else if child.is_element() {
             if child.has_tag_name("a")
-                && let Some(n) = note_ref_at(&child) {
-                    s.push_str(&format!(" [^{n}] "));
-                    continue; // 跳过其 `<sup>[N]</sup>` 子节点
-                }
+                && let Some(n) = note_ref_at(&child)
+            {
+                s.push_str(&format!(" [^{n}] "));
+                continue; // 跳过其 `<sup>[N]</sup>` 子节点
+            }
             s.push_str(&node_text_epub(&child, depth + 1));
         }
     }
@@ -1029,10 +1147,11 @@ fn walk_text_lines(node: &roxmltree::Node, depth: usize, segs: &mut Vec<String>)
                 continue;
             }
             if child.has_tag_name("a")
-                && let Some(n) = note_ref_at(&child) {
-                    segs.last_mut().unwrap().push_str(&format!(" [^{n}] "));
-                    continue;
-                }
+                && let Some(n) = note_ref_at(&child)
+            {
+                segs.last_mut().unwrap().push_str(&format!(" [^{n}] "));
+                continue;
+            }
             walk_text_lines(&child, depth + 1, segs);
         }
     }
@@ -1104,7 +1223,11 @@ mod tests {
     #[test]
     fn extracts_chapters_in_spine_order() {
         let doc = parse_epub_file(&test_epub_path()).expect("解析 测试epub.epub 应成功");
-        assert!(doc.chapter_count >= 5, "应有多个章节，实际={}", doc.chapter_count);
+        assert!(
+            doc.chapter_count >= 5,
+            "应有多个章节，实际={}",
+            doc.chapter_count
+        );
         assert!(!doc.markdown.is_empty());
         // 应包含著名开头标题之一（1888年英文版序言 或 第一章 资产者和无产者）
         let any = ["1888年英文版序言", "资产者和无产者"]
@@ -1182,16 +1305,31 @@ mod tests {
         let no: Option<String> = None;
         let mut notes = std::collections::BTreeMap::new();
         let md = xhtml_to_markdown(html, &mut |_s, _a| no.clone(), &mut notes);
-        assert!(md.contains("%%ALIGN:RIGHT%%卡尔·马克思"), "签名应带右对齐指令：{md}");
+        assert!(
+            md.contains("%%ALIGN:RIGHT%%卡尔·马克思"),
+            "签名应带右对齐指令：{md}"
+        );
         // `<br>` 应把签名拆成两行，且每行都带右对齐指令（日期单独成行）。
         assert!(
             md.contains("%%ALIGN:RIGHT%%卡尔·马克思\n%%ALIGN:RIGHT%%1872年6月24日于伦敦"),
             "签名 `<br>` 应拆行且两行都右对齐：{md:?}"
         );
-        assert!(!md.contains("卡尔·马克思1872年6月24日于伦敦"), "日期不得与姓名挤在一行: {md:?}");
-        assert!(md.contains("%%ALIGN:RIGHT%%原文是德文"), "float-r 应带右对齐指令：{md}");
-        assert!(md.contains("%%ALIGN:LEFT%%卡·马克思写于1872年"), "float-l 应带左对齐指令：{md}");
-        assert!(!md.contains("%%ALIGN:%普通正文段"), "普通正文不应带对齐指令：{md}");
+        assert!(
+            !md.contains("卡尔·马克思1872年6月24日于伦敦"),
+            "日期不得与姓名挤在一行: {md:?}"
+        );
+        assert!(
+            md.contains("%%ALIGN:RIGHT%%原文是德文"),
+            "float-r 应带右对齐指令：{md}"
+        );
+        assert!(
+            md.contains("%%ALIGN:LEFT%%卡·马克思写于1872年"),
+            "float-l 应带左对齐指令：{md}"
+        );
+        assert!(
+            !md.contains("%%ALIGN:%普通正文段"),
+            "普通正文不应带对齐指令：{md}"
+        );
         assert!(
             md.contains("\u{3000}\u{3000}普通正文段。"),
             "正文（class=text）应首行缩进 2 全角空格：{md:?}"
@@ -1233,7 +1371,10 @@ mod tests {
             let mut notes = std::collections::BTreeMap::new();
             xhtml_to_markdown(html, &mut on_img, &mut notes)
         };
-        assert!(md.contains("![插图一](/tmp/x/p1.jpeg)"), "图片应转成 markdown 图片，实际={md:?}");
+        assert!(
+            md.contains("![插图一](/tmp/x/p1.jpeg)"),
+            "图片应转成 markdown 图片，实际={md:?}"
+        );
     }
 
     #[test]
@@ -1242,7 +1383,10 @@ mod tests {
         let no: Option<String> = None;
         let mut notes = std::collections::BTreeMap::new();
         let md = xhtml_to_markdown(html, &mut |_s, _a| no.clone(), &mut notes);
-        assert!(md.contains("[图片：图A]"), "无解析结果应输出占位，实际={md:?}");
+        assert!(
+            md.contains("[图片：图A]"),
+            "无解析结果应输出占位，实际={md:?}"
+        );
     }
 
     #[test]
@@ -1265,8 +1409,14 @@ mod tests {
 
     #[test]
     fn join_zip_path_resolves_parent() {
-        assert_eq!(join_zip_path("OEBPS", "text/ch1.xhtml"), "OEBPS/text/ch1.xhtml");
-        assert_eq!(join_zip_path("OEBPS", "../META-INF/container.xml"), "META-INF/container.xml");
+        assert_eq!(
+            join_zip_path("OEBPS", "text/ch1.xhtml"),
+            "OEBPS/text/ch1.xhtml"
+        );
+        assert_eq!(
+            join_zip_path("OEBPS", "../META-INF/container.xml"),
+            "META-INF/container.xml"
+        );
         assert_eq!(join_zip_path("", "text/ch1.xhtml"), "text/ch1.xhtml");
     }
 
@@ -1281,8 +1431,14 @@ mod tests {
         let no: Option<String> = None;
         let mut notes = std::collections::BTreeMap::new();
         let md = xhtml_to_markdown(html, &mut |_s, _a| no.clone(), &mut notes);
-        assert!(md.contains("# 第一章"), "带 DOCTYPE 的 XHTML 应提取标题：{md:?}");
-        assert!(md.contains("正文内容。"), "带 DOCTYPE 的 XHTML 应提取段落：{md:?}");
+        assert!(
+            md.contains("# 第一章"),
+            "带 DOCTYPE 的 XHTML 应提取标题：{md:?}"
+        );
+        assert!(
+            md.contains("正文内容。"),
+            "带 DOCTYPE 的 XHTML 应提取段落：{md:?}"
+        );
     }
 
     #[test]
@@ -1422,8 +1578,11 @@ mod tests {
             let mut buf = std::io::Cursor::new(Vec::new());
             {
                 let mut w = zip::ZipWriter::new(&mut buf);
-                let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-                let add = |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
+                let opts =
+                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+                let add = |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>,
+                           name: &str,
+                           data: &[u8]| {
                     w.start_file(name, opts).unwrap();
                     w.write_all(data).unwrap();
                 };
@@ -1467,13 +1626,14 @@ mod tests {
             let mut buf = std::io::Cursor::new(Vec::new());
             {
                 let mut w = zip::ZipWriter::new(&mut buf);
-                let opts =
-                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-                let add =
-                    |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
-                        w.start_file(name, opts).unwrap();
-                        w.write_all(data).unwrap();
-                    };
+                let opts = SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                let add = |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>,
+                           name: &str,
+                           data: &[u8]| {
+                    w.start_file(name, opts).unwrap();
+                    w.write_all(data).unwrap();
+                };
                 add(
                     &mut w,
                     "META-INF/container.xml",
@@ -1621,12 +1781,17 @@ mod tests {
                 chapter.push_str(&format!(r#"<img src="images/p{i}.png"/>"#));
             }
             chapter.push_str("</body></html>");
-            let png = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 0];
-            let zip = make_epub(&chapter, &[
-                ("images/p0.png", &png),
-                ("images/p1.png", &png),
-                ("images/p2.png", &png),
-            ]);
+            let png = [
+                0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0, 0, 0,
+            ];
+            let zip = make_epub(
+                &chapter,
+                &[
+                    ("images/p0.png", &png),
+                    ("images/p1.png", &png),
+                    ("images/p2.png", &png),
+                ],
+            );
             let mut limits = EpubLimits::default();
             limits.max_image_count = 2; // 只收前 2 张
             limits.max_image_bytes = 1 << 20;
@@ -1648,11 +1813,14 @@ mod tests {
             chapter.push_str("</body></html>");
             let png8 = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
             // 每张 8B（真实图片数据任意，read 到点位即融）——总量闸只需字节和。
-            let zip = make_epub(&chapter, &[
-                ("images/p0.png", &png8),
-                ("images/p1.png", &png8),
-                ("images/p2.png", &png8),
-            ]);
+            let zip = make_epub(
+                &chapter,
+                &[
+                    ("images/p0.png", &png8),
+                    ("images/p1.png", &png8),
+                    ("images/p2.png", &png8),
+                ],
+            );
             let mut limits = EpubLimits::default();
             limits.max_image_bytes = 1 << 20;
             limits.max_image_total_bytes = 16; // 3×8=24 > 16 → 收 2 张后第 3 张拒
@@ -1671,7 +1839,8 @@ mod tests {
             let mut buf = std::io::Cursor::new(Vec::new());
             {
                 let mut w = zip::ZipWriter::new(&mut buf);
-                let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+                let opts =
+                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
                 w.start_file("META-INF/container.xml", opts).unwrap();
                 w.write_all(br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
                 let manifest = r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title></metadata><manifest><item id="c0" href="c0.xhtml" media-type="application/xhtml+xml"/><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c0"/><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
@@ -1718,20 +1887,18 @@ mod tests {
         ///
         /// 复现缺陷 1（lib.rs img_cache 按原始 src 而非解析后 zip 路径去重）：
         /// 两章 `src` 相同 → 后章被去重到首章条目 → 章节 b 渲染出章节 a 的字节（错图）。
-        fn make_epub_same_src_diff_paths(
-            img_a: &[u8],
-            img_b: &[u8],
-        ) -> std::io::Cursor<Vec<u8>> {
+        fn make_epub_same_src_diff_paths(img_a: &[u8], img_b: &[u8]) -> std::io::Cursor<Vec<u8>> {
             let mut buf = std::io::Cursor::new(Vec::new());
             {
                 let mut w = zip::ZipWriter::new(&mut buf);
-                let opts = SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Stored);
-                let add =
-                    |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
-                        w.start_file(name, opts).unwrap();
-                        w.write_all(data).unwrap();
-                    };
+                let opts =
+                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+                let add = |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>,
+                           name: &str,
+                           data: &[u8]| {
+                    w.start_file(name, opts).unwrap();
+                    w.write_all(data).unwrap();
+                };
                 add(
                     &mut w,
                     "META-INF/container.xml",
@@ -1774,8 +1941,12 @@ mod tests {
         #[test]
         fn img_cache_keys_by_zip_path_not_src() {
             // 两张 12B 图：PNG 魔数 + 区分标记（0xAA / 0xBB）。
-            let img_a = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0xAA, 0xAA, 0xAA, 0xAA];
-            let img_b = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0xBB, 0xBB, 0xBB, 0xBB];
+            let img_a = [
+                0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0xAA, 0xAA, 0xAA, 0xAA,
+            ];
+            let img_b = [
+                0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0xBB, 0xBB, 0xBB, 0xBB,
+            ];
             let zip = make_epub_same_src_diff_paths(&img_a, &img_b);
             let doc = parse_epub_reader(zip).expect("解析应成功");
             // 断言 1（红）：两个不同 zip 路径的图应分属两个内存条目。
@@ -1786,8 +1957,16 @@ mod tests {
                 doc.images.len()
             );
             // 断言 2（红）：两章 markdown 应引用两个**不同**的虚拟 src。
-            let img_lines: Vec<&str> = doc.markdown.lines().filter(|l| l.starts_with("![")).collect();
-            assert_eq!(img_lines.len(), 2, "两章各应有一张图，实际 markdown：{doc:?}");
+            let img_lines: Vec<&str> = doc
+                .markdown
+                .lines()
+                .filter(|l| l.starts_with("!["))
+                .collect();
+            assert_eq!(
+                img_lines.len(),
+                2,
+                "两章各应有一张图，实际 markdown：{doc:?}"
+            );
             let vsrcs: std::collections::HashSet<&str> = img_lines
                 .iter()
                 .filter_map(|l| {
@@ -1808,7 +1987,11 @@ mod tests {
                 .map(|img| img.bytes.last().copied().unwrap())
                 .collect();
             markers.sort_unstable();
-            assert_eq!(markers, vec![0xAA, 0xBB], "两图字节应分别保留，实际标记：{markers:?}");
+            assert_eq!(
+                markers,
+                vec![0xAA, 0xBB],
+                "两图字节应分别保留，实际标记：{markers:?}"
+            );
         }
 
         /// 缺陷 2 红测：`&nbsp;`（XML 未预定义**命名**实体）→ roxmltree parse Err →
@@ -1848,13 +2031,14 @@ mod tests {
             let mut buf = std::io::Cursor::new(Vec::new());
             {
                 let mut w = zip::ZipWriter::new(&mut buf);
-                let opts = SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Stored);
-                let add =
-                    |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>, name: &str, data: &[u8]| {
-                        w.start_file(name, opts).unwrap();
-                        w.write_all(data).unwrap();
-                    };
+                let opts =
+                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+                let add = |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>,
+                           name: &str,
+                           data: &[u8]| {
+                    w.start_file(name, opts).unwrap();
+                    w.write_all(data).unwrap();
+                };
                 add(
                     &mut w,
                     "META-INF/container.xml",
@@ -1870,7 +2054,11 @@ mod tests {
   <spine><itemref idref="ch1"/></spine>
 </package>"#;
                 add(&mut w, "OEBPS/content.opf", opf.as_bytes());
-                add(&mut w, "OEBPS/ch1.xhtml", b"<html><body><p>x</p></body></html>");
+                add(
+                    &mut w,
+                    "OEBPS/ch1.xhtml",
+                    b"<html><body><p>x</p></body></html>",
+                );
                 for i in 0..junk_count {
                     add(&mut w, &format!("junk/junk{i:05}.bin"), b"");
                 }
@@ -1892,6 +2080,95 @@ mod tests {
                 res.is_err(),
                 "条目总数超上限（{} 条 > 65536）应整档拒绝，实际解析通过",
                 JUNK + 3
+            );
+        }
+    }
+
+    // ===== 2026-11-24 红测：epub 脚注跨章冲突（每章独立重新编号的书型）=====
+    // 多数书每章脚注独立重新编号（两章都含 footnote1/2），正文 `[^1]` 引用本
+    // 章 `p.note` 定义。旧实现只建一张全局 notes 表、`or_insert` first-wins →
+    // 后章同名定义被丢弃，悬停/渲染显示前章脚注。本测试用内存 zip 造两章
+    // 独立编号的脚注书，断言第二章引用解析到第二章自己的定义文本。
+    mod footnote_cross_chapter {
+        use super::*;
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        /// 造一本两章节、各自独立重新编号脚注的最小合法 EPUB：两章都含
+        /// footnote1/2（正文 `[^1][^2]` + 本章 `p.note` 定义），但两章定义文本不同。
+        fn make_two_chapter_epub() -> std::io::Cursor<Vec<u8>> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut buf);
+                let opts =
+                    SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+                let add = |w: &mut zip::ZipWriter<&mut std::io::Cursor<Vec<u8>>>,
+                           name: &str,
+                           data: &[u8]| {
+                    w.start_file(name, opts).unwrap();
+                    w.write_all(data).unwrap();
+                };
+                add(
+                    &mut w,
+                    "META-INF/container.xml",
+                    br#"<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+                );
+                let opf = r#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="2.0"><metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">两章书</dc:title></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>"#;
+                add(&mut w, "OEBPS/content.opf", opf.as_bytes());
+                // 第一章：独立编号 1/2，定义文本「第一章…」
+                add(
+                    &mut w,
+                    "OEBPS/c1.xhtml",
+                    r#"<html><body><p class="text">第一章甲<a id="note1" href="c1.xhtml#footnote1"><sup>[1]</sup></a>、乙<a id="note2" href="c1.xhtml#footnote2"><sup>[2]</sup></a>。</p><p class="note"><a id="footnote1" href="c1.xhtml#note1">[1]</a> 第一章的脚注一。</p><p class="note"><a id="footnote2" href="c1.xhtml#note2">[2]</a> 第一章的脚注二。</p></body></html>"#.as_bytes(),
+                );
+                // 第二章：同样独立编号 1/2，但定义文本不同
+                add(
+                    &mut w,
+                    "OEBPS/c2.xhtml",
+                    r#"<html><body><p class="text">第二章甲<a id="note1" href="c2.xhtml#footnote1"><sup>[1]</sup></a>、乙<a id="note2" href="c2.xhtml#footnote2"><sup>[2]</sup></a>。</p><p class="note"><a id="footnote1" href="c2.xhtml#note1">[1]</a> 第二章的脚注一。</p><p class="note"><a id="footnote2" href="c2.xhtml#note2">[2]</a> 第二章的脚注二。</p></body></html>"#.as_bytes(),
+                );
+                w.finish().unwrap();
+            }
+            buf.set_position(0);
+            buf
+        }
+
+        /// 找 `md` 里 `from` 之后第一个 `[^N]` 引用标记的裸号 N。
+        fn next_ref(md: &str, from: &str) -> usize {
+            let start = md.find(from).expect("应含定位文本");
+            let rest = &md[start..];
+            let p = rest.find("[^").expect("应含脚注引用 [^N]");
+            let digits: String = rest[p + 2..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            assert!(!digits.is_empty(), "引用标记后应有数字：{rest:?}");
+            digits.parse().unwrap()
+        }
+
+        #[test]
+        fn cross_chapter_footnotes_do_not_collide() {
+            let doc = parse_epub_reader(make_two_chapter_epub()).expect("两章脚注书解析应成功");
+            // 第一章自身脚注：定义与引用应一致（既有行为，回归护栏）。
+            let n1 = next_ref(&doc.markdown, "第一章甲");
+            assert_eq!(
+                doc.notes.get(&n1).map(|s| s.as_str()),
+                Some("第一章的脚注一。"),
+                "第一章 [^1] 应解析到第一章自己的定义文本"
+            );
+            // 红：旧实现 second-wins 被 first-wins 丢弃 → 第二章 [^1] 解析到第一章文本。
+            let n2 = next_ref(&doc.markdown, "第二章甲");
+            assert_eq!(
+                doc.notes.get(&n2).map(|s| s.as_str()),
+                Some("第二章的脚注一。"),
+                "第二章 [^1] 应解析到第二章自己的定义文本"
+            );
+            // 红：两章各 1/2 号共 4 条定义都应保留（旧实现只有 2 条）。
+            assert_eq!(
+                doc.notes.len(),
+                4,
+                "两章各自 1/2 号脚注应互不覆盖：{:?}",
+                doc.notes
             );
         }
     }

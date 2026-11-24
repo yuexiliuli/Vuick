@@ -2,7 +2,6 @@
 //! ListState 固定窗口重定位（`resync_list`）、纵向/横向滚动与锚定揭示（`reveal_*`）、
 //! 行几何查询（`row_layout` / `ruler_screen_x`）与点命中（`offset_at_point`）。
 
-
 use gpui::{
     point,
     px,
@@ -16,9 +15,6 @@ use gpui::{
     Window,
 };
 
-use config::limits::{
-    EDITOR_VSCROLL_BOTTOM_EXTRA_LINES,
-};
 use super::{
     CodeEditor,
     FOLD_ARROW_SLOT_PX,
@@ -26,6 +22,9 @@ use super::{
     GUTTER_RIGHT_PAD_PX,
     HSCROLL_MARGIN_COLS,
     LIST_WINDOW_ROWS,
+};
+use config::limits::{
+    EDITOR_VSCROLL_BOTTOM_EXTRA_LINES,
 };
 
 /// 渲染行吸附行距（pitch）：`ceil(lh − 0.5)` 夹低到 ≥1.0——rhtz 正值变体
@@ -38,7 +37,6 @@ pub(crate) fn pitch_for_line_height(lh: f32) -> f32 {
 }
 
 impl CodeEditor {
-
     /// 列表视口高（px，测试断言用：List 必须撑满容器，否则可见行数为 0）。
     // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
     pub fn list_viewport_height(&self) -> f32 {
@@ -51,7 +49,7 @@ impl CodeEditor {
     pub fn list_max_offset(&self) -> f32 {
         (self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
             - self.list_state.viewport_bounds().size.height.as_f32())
-            .max(0.)
+        .max(0.)
     }
 
     /// 纵向量程总高（px）。像素路径 = 条目总数 × 行高（含底部预留空行；确定性），
@@ -188,6 +186,9 @@ impl CodeEditor {
             self.metric_fp = Some(metric_fp);
             self.metrics_ready = true;
             self.metric_compute_count += 1;
+            // 字体/字号变 → 每字符真实宽变 → 前缀宽索引全部作废（宽度与字形挂钩，
+            // 与 `RowCache` 的内容缓存正交，独立失效；下帧按需重建）。
+            self.row_width_cache.clear();
         }
 
         // 字号缩放（Ctrl+滚轮 / Ctrl+=/-）会同比改变行高：把「用户滚动目标」按行高比
@@ -428,7 +429,10 @@ impl CodeEditor {
     fn px_to_offset(px: f32, lh: f32) -> ListOffset {
         let item_ix = (px / lh).floor().max(0.) as usize;
         let offset = px - item_ix as f32 * lh;
-        ListOffset { item_ix, offset_in_item: gpui::px(offset.max(0.)) }
+        ListOffset {
+            item_ix,
+            offset_in_item: gpui::px(offset.max(0.)),
+        }
     }
 
     /// 把固定窗口对齐到用户目标（`desired_scroll`，绝对 px）：目标窗口覆盖不足一屏则
@@ -449,7 +453,10 @@ impl CodeEditor {
             self.list_state.reset(LIST_WINDOW_ROWS);
         }
         let rel = abs_top.saturating_sub(self.window_base);
-        self.list_state.scroll_to(ListOffset { item_ix: rel, offset_in_item: px(frac) });
+        self.list_state.scroll_to(ListOffset {
+            item_ix: rel,
+            offset_in_item: px(frac),
+        });
         self.desired_scroll.set(target);
     }
 
@@ -654,7 +661,11 @@ impl CodeEditor {
             underline: None,
             strikethrough: None,
         };
-        Some(window.text_system().shape_line(text, self.font_size, &[run], None))
+        Some(
+            window
+                .text_system()
+                .shape_line(text, self.font_size, &[run], None),
+        )
     }
 
     pub(super) fn offset_at_point(&self, position: Point<Pixels>, window: &mut Window) -> usize {
@@ -680,7 +691,9 @@ impl CodeEditor {
         if let Some(layout) = self.row_layout(window, row) {
             // closest_index_for_x 返回**行内字节索引**，且总落在字符边界上
             // （绝不把光标拆进 CJK/emoji 中间）。
-            return self.buffer.clip(line_start + layout.closest_index_for_x(px(x_text)));
+            return self
+                .buffer
+                .clip(line_start + layout.closest_index_for_x(px(x_text)));
         }
         // 兜底（度量未就绪等）：等宽近似。
         let col_rel = (x_text / self.char_width.as_f32().max(1.)).floor() as usize;

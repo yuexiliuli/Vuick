@@ -69,7 +69,11 @@ pub fn take_pending_patch_blocks(rd: &RefCell<WyRenderModel>) -> Option<Vec<usiz
     rd.borrow_mut().pending_patch_blocks.borrow_mut().take()
 }
 pub(crate) fn fold_plan_rc(rd: &RefCell<WyRenderModel>) -> Option<Rc<FoldPlan>> {
-    rd.borrow().fold_plan.borrow().as_ref().map(|(_, _, p)| p.clone())
+    rd.borrow()
+        .fold_plan
+        .borrow()
+        .as_ref()
+        .map(|(_, _, p)| p.clone())
 }
 /// 某 mermaid 围栏块的缩放（缺省 1.0）。
 pub fn mermaid_zoom_of(rd: &RefCell<WyRenderModel>, src_line: usize) -> f32 {
@@ -83,9 +87,15 @@ pub fn mermaid_zoom_of(rd: &RefCell<WyRenderModel>, src_line: usize) -> f32 {
 /// 数学卡内容自然宽侧缓存写（px；键 = 数学块首源码行）。
 pub fn set_math_natural_w(rd: &RefCell<WyRenderModel>, src_line: usize, w: f32) {
     if w > 0.01 {
-        rd.borrow_mut().math_natural_w.borrow_mut().insert(src_line, w);
+        rd.borrow_mut()
+            .math_natural_w
+            .borrow_mut()
+            .insert(src_line, w);
     } else {
-        rd.borrow_mut().math_natural_w.borrow_mut().remove(&src_line);
+        rd.borrow_mut()
+            .math_natural_w
+            .borrow_mut()
+            .remove(&src_line);
     }
 }
 /// 录制/更新某块 `$$` 卡的最近就绪位图钉。
@@ -135,7 +145,11 @@ pub fn cool_start(rd: &RefCell<WyRenderModel>, block: usize) -> bool {
 }
 /// notdef 后保存本帧几何（供随后的冷却帧显示复用）。
 pub fn cool_keep_last(rd: &RefCell<WyRenderModel>, block: usize, row: Rc<ShapedRow>) {
-    rd.borrow_mut().notdef_retry.borrow_mut().last.insert(block, row);
+    rd.borrow_mut()
+        .notdef_retry
+        .borrow_mut()
+        .last
+        .insert(block, row);
 }
 /// 该块是否已判定「确无字形」（settled）。
 pub fn notdef_settled(rd: &RefCell<WyRenderModel>, block: usize) -> bool {
@@ -153,11 +167,19 @@ pub fn fallback_verified(rd: &RefCell<WyRenderModel>, block: usize) -> bool {
     rd.borrow().notdef_retry.borrow().verified.contains(&block)
 }
 pub fn mark_fallback_verified(rd: &RefCell<WyRenderModel>, block: usize) {
-    rd.borrow_mut().notdef_retry.borrow_mut().verified.insert(block);
+    rd.borrow_mut()
+        .notdef_retry
+        .borrow_mut()
+        .verified
+        .insert(block);
 }
 /// 回退校验冷却：只置冷却标志（不占 notdef 重试次数）。
 pub fn verify_cool(rd: &RefCell<WyRenderModel>, block: usize) {
-    rd.borrow_mut().notdef_retry.borrow_mut().cooling.insert(block);
+    rd.borrow_mut()
+        .notdef_retry
+        .borrow_mut()
+        .cooling
+        .insert(block);
 }
 
 /// （仅宿主测试用）Pass2 光栅/冷却/预热计数器自增。宿主 `markdown_wysiwyg` 测试构建
@@ -193,7 +215,12 @@ pub fn ensure_block_layout(
     {
         return (false, l.clone(), None);
     }
-    let old = rd.borrow().block_layout.borrow().as_ref().map(|(_, l)| l.clone());
+    let old = rd
+        .borrow()
+        .block_layout
+        .borrow()
+        .as_ref()
+        .map(|(_, l)| l.clone());
     let l = Rc::new(std::cell::RefCell::new(BlockLayout::empty()));
     *rd.borrow_mut().block_layout.borrow_mut() = Some((epoch, l.clone()));
     (true, l, old)
@@ -305,10 +332,11 @@ fn build_fp_sets(derived: &Rc<RefCell<WyDerived>>) -> Rc<FoldPlanSets> {
             math_regions.len(),
             std::default::Default::default(),
         );
-    let mut math_body: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::with_capacity_and_hasher(
-        math_regions.len() * 2,
-        std::default::Default::default(),
-    );
+    let mut math_body: rustc_hash::FxHashSet<usize> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(
+            math_regions.len() * 2,
+            std::default::Default::default(),
+        );
     for (idx, reg) in math_regions.iter().enumerate() {
         math_start.insert(reg.range.start, idx);
         math_body.extend(reg.range.start + 1..reg.range.end);
@@ -369,6 +397,12 @@ fn fold_plan_deltas_shifted(
     sets: Rc<FoldPlanSets>,
 ) -> Option<Rc<FoldPlan>> {
     if !rd.borrow().struct_edit_pending.get() {
+        return None;
+    }
+    // M5-B3-1 增补：结构编辑经「局部重扫回填」就地改了区域内容/几何（`regions_ver`
+    // 未递增）→ deltas 增量平移前提「区域身份未变」被破坏（未闭合 `$$` 的卡块可远离
+    // 编辑行），回退整建（读取即清；整建 O(块数)，远便宜于 `derived` 的 O(N) 全文扫）。
+    if rd.borrow_mut().struct_region_content_changed.replace(false) {
         return None;
     }
     let old_plan = {
@@ -560,7 +594,8 @@ pub fn fold_reveal(
     {
         let d = derived(rd, doc);
         let d = d.borrow();
-        if let Some(ridx) = region_containing(&d.math_regions, |r| r.range.clone(), caret_line, true)
+        if let Some(ridx) =
+            region_containing(&d.math_regions, |r| r.range.clone(), caret_line, true)
         {
             let reg = &d.math_regions[ridx];
             let rng = reg.range.clone();
@@ -652,7 +687,10 @@ pub fn set_image_size(
     let changed = rd.borrow().image_sizes.borrow().get(&src).copied() != Some(size);
     if changed {
         invalidate_image_row_cache(rd, doc, &src);
-        rd.borrow_mut().image_sizes.borrow_mut().insert(src.clone(), size);
+        rd.borrow_mut()
+            .image_sizes
+            .borrow_mut()
+            .insert(src.clone(), size);
         {
             let rdg = rd.borrow_mut();
             rdg.images_gen
@@ -813,7 +851,10 @@ fn debug_special_row(
     }
     {
         let mut last = LAST_SPECIAL_ROW.lock().unwrap();
-        if last.as_ref().is_some_and(|(lr, ls)| *lr == rl && *ls == sig) {
+        if last
+            .as_ref()
+            .is_some_and(|(lr, ls)| *lr == rl && *ls == sig)
+        {
             return;
         }
         *last = Some((rl, sig));
@@ -849,7 +890,10 @@ pub fn pass1_base_layout(
         let mut hi = n;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let sl = doc.block_meta(mid).map(|m| m.src_line as usize).unwrap_or(doc_lines);
+            let sl = doc
+                .block_meta(mid)
+                .map(|m| m.src_line as usize)
+                .unwrap_or(doc_lines);
             if sl <= dirty_line {
                 lo = mid + 1;
             } else {
@@ -896,7 +940,10 @@ pub fn pass1_base_layout(
         let mut hi = n;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let sl = doc.block_meta(mid).map(|m| m.src_line as i64).unwrap_or(i64::MAX);
+            let sl = doc
+                .block_meta(mid)
+                .map(|m| m.src_line as i64)
+                .unwrap_or(i64::MAX);
             if sl >= tail_src {
                 hi = mid;
             } else {
@@ -944,10 +991,15 @@ pub fn pass1_base_layout(
     for i in mid_start..k {
         middle.push(est_block(i));
     }
-    let tail_ok = matches!(old_n, Some(n_old) if k <= n && j <= n_old && n_old - j == n - k && keep <= n_old);
+    let tail_ok =
+        matches!(old_n, Some(n_old) if k <= n && j <= n_old && n_old - j == n - k && keep <= n_old);
     if tail_ok {
-        let old_ref = old_holder.as_ref().expect("tail_ok 蕴含旧布局在场").borrow();
-        base.borrow_mut().apply_structural_edit(&old_ref, keep, &middle, j, line_delta, n);
+        let old_ref = old_holder
+            .as_ref()
+            .expect("tail_ok 蕴含旧布局在场")
+            .borrow();
+        base.borrow_mut()
+            .apply_structural_edit(&old_ref, keep, &middle, j, line_delta, n);
         crate::prof::end("wy.pass1", _t_p1);
         return;
     }
@@ -1108,7 +1160,14 @@ pub fn prebuild_block_height(
             raw_len: 0,
             aux: pb.aux,
         };
-        f32::from(estimate_height(&meta, pb.chars as usize, pb.ascii, theme, avail, line_h))
+        f32::from(estimate_height(
+            &meta,
+            pb.chars as usize,
+            pb.ascii,
+            theme,
+            avail,
+            line_h,
+        ))
     }
 }
 
@@ -1204,116 +1263,124 @@ fn pass2_shape_band(
     let math_start = &plan.sets.math_start;
     let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
     let mut i = i0;
+    while i < i1 {
+        let srcline = base.borrow().src_line(i) as usize;
+        let blocked = !reveal.contains(srcline)
+            && (fold_lines.contains(&srcline)
+                || math_body.contains(&srcline)
+                || math_start.contains_key(&srcline));
+        if blocked {
+            i += 1;
+            continue;
+        }
+        let lo = i;
         while i < i1 {
-            let srcline = base.borrow().src_line(i) as usize;
-            let blocked = !reveal.contains(srcline)
-                && (fold_lines.contains(&srcline)
-                    || math_body.contains(&srcline)
-                    || math_start.contains_key(&srcline));
-            if blocked {
-                i += 1;
-                continue;
+            let s = base.borrow().src_line(i) as usize;
+            if !reveal.contains(s)
+                && (fold_lines.contains(&s)
+                    || math_body.contains(&s)
+                    || math_start.contains_key(&s))
+            {
+                break;
             }
-            let lo = i;
-            while i < i1 {
-                let s = base.borrow().src_line(i) as usize;
-                if !reveal.contains(s)
-                    && (fold_lines.contains(&s)
-                        || math_body.contains(&s)
-                        || math_start.contains_key(&s))
-                {
-                    break;
-                }
-                i += 1;
-            }
-            let hi = i;
-            let (need_row, mut hit_map) =
-                band_hit_test(rd, doc, base, lo, hi, caret_line, shape_key);
-            let mut rows_map = band_parse_rows(doc, &need_row);
-            let _t_shape = crate::prof::begin();
-            for k in lo..hi {
-                let mut srow = if let Some(rc) = hit_map.remove(&k) {
-                    (*rc).clone()
-                } else if is_giant_code_block(doc, base, k) {
-                    giant_fast_row(rd, doc, base, k, shape_key, content_gen(rd))
-                } else if let Some(last) = cooling_row(rd, k) {
-                    window.refresh();
-                    #[cfg(feature = "test-mode")]
-                    bump_coolings(rd);
-                    (*last).clone()
-                } else {
-                    // cid（全内容指纹）只在真正 shape 的块上算（P1-C1：指纹含整块字节，
-                    // 命中/巨块/cooling 分支不消费它——提前算会让带内巨块每帧整块重 hash）。
-                    let cid = block_content_id(doc, k);
-                    let r = rows_map.remove(&k).expect("未命中 / caret 行应已被物化");
-                    let is_caret = !matches!(r.kind, IrKind::Code | IrKind::Table | IrKind::Image)
-                        && caret_line == r.src_line;
-                    let rl = r.src_line;
-                    #[cfg(feature = "test-mode")]
-                    bump_reshapes(rd);
-                    let srow = crate::shape::shape_docrow(r, rd, host, window, width, avail, theme, base_font);
-                    if shaped_row_has_notdef(&srow) {
-                        if notdef_settled(rd, k) {
+            i += 1;
+        }
+        let hi = i;
+        let (need_row, mut hit_map) = band_hit_test(rd, doc, base, lo, hi, caret_line, shape_key);
+        let mut rows_map = band_parse_rows(doc, &need_row);
+        let _t_shape = crate::prof::begin();
+        for k in lo..hi {
+            let mut srow = if let Some(rc) = hit_map.remove(&k) {
+                (*rc).clone()
+            } else if is_giant_code_block(doc, base, k) {
+                giant_fast_row(rd, doc, base, k, shape_key, content_gen(rd))
+            } else if let Some(last) = cooling_row(rd, k) {
+                window.refresh();
+                #[cfg(feature = "test-mode")]
+                bump_coolings(rd);
+                (*last).clone()
+            } else {
+                // cid（全内容指纹）只在真正 shape 的块上算（P1-C1：指纹含整块字节，
+                // 命中/巨块/cooling 分支不消费它——提前算会让带内巨块每帧整块重 hash）。
+                let cid = block_content_id(doc, k);
+                let r = rows_map.remove(&k).expect("未命中 / caret 行应已被物化");
+                let is_caret = !matches!(r.kind, IrKind::Code | IrKind::Table | IrKind::Image)
+                    && caret_line == r.src_line;
+                let rl = r.src_line;
+                #[cfg(feature = "test-mode")]
+                bump_reshapes(rd);
+                let srow =
+                    crate::shape::shape_docrow(r, rd, host, window, width, avail, theme, base_font);
+                if shaped_row_has_notdef(&srow) {
+                    if notdef_settled(rd, k) {
+                        srow
+                    } else if cool_start(rd, k) {
+                        notdef_debug(format_args!(
+                            "pass2 give-up k={} src={} caret={is_caret}",
+                            k, rl
+                        ));
+                        if is_caret {
                             srow
-                        } else if cool_start(rd, k) {
-                            notdef_debug(format_args!(
-                                "pass2 give-up k={} src={} caret={is_caret}",
-                                k, rl
-                            ));
-                            if is_caret {
-                                srow
-                            } else {
-                                let rc = rd.borrow_mut().shape_rows.borrow_mut().put(cid, shape_key, srow);
-                                (*rc).clone()
-                            }
                         } else {
-                            window.refresh();
-                            cool_keep_last(rd, k, std::rc::Rc::new(srow.clone()));
-                            notdef_debug(format_args!(
-                                "pass2 notdef k={} src={} caret={is_caret} -> cooling",
-                                k, rl
-                            ));
-                            srow
+                            let rc = rd
+                                .borrow_mut()
+                                .shape_rows
+                                .borrow_mut()
+                                .put(cid, shape_key, srow);
+                            (*rc).clone()
                         }
-                    } else if row_uses_fallback(window.text_system(), base_font, &srow)
-                        && !fallback_verified(rd, k)
-                    {
-                        mark_fallback_verified(rd, k);
-                        verify_cool(rd, k);
+                    } else {
                         window.refresh();
                         cool_keep_last(rd, k, std::rc::Rc::new(srow.clone()));
                         notdef_debug(format_args!(
-                            "pass2 fallback-verify k={} src={} caret={is_caret}",
+                            "pass2 notdef k={} src={} caret={is_caret} -> cooling",
                             k, rl
                         ));
                         srow
-                    } else {
-                        clear_notdef(rd, k);
-                        if is_caret && !srow.extra.inline_maths.is_empty() {
-                            srow
-                        } else {
-                            let rc = rd.borrow_mut().shape_rows.borrow_mut().put(cid, shape_key, srow);
-                            (*rc).clone()
-                        }
                     }
-                };
-                let srcl = base.borrow().src_line(k) as usize;
-                let srcl_next = {
-                    let b = base.borrow();
-                    if k + 1 < b.n() {
-                        b.src_line(k + 1) as usize
+                } else if row_uses_fallback(window.text_system(), base_font, &srow)
+                    && !fallback_verified(rd, k)
+                {
+                    mark_fallback_verified(rd, k);
+                    verify_cool(rd, k);
+                    window.refresh();
+                    cool_keep_last(rd, k, std::rc::Rc::new(srow.clone()));
+                    notdef_debug(format_args!(
+                        "pass2 fallback-verify k={} src={} caret={is_caret}",
+                        k, rl
+                    ));
+                    srow
+                } else {
+                    clear_notdef(rd, k);
+                    if is_caret && !srow.extra.inline_maths.is_empty() {
+                        srow
                     } else {
-                        doc.line_count().max(srcl + 1)
+                        let rc = rd
+                            .borrow_mut()
+                            .shape_rows
+                            .borrow_mut()
+                            .put(cid, shape_key, srow);
+                        (*rc).clone()
                     }
-                };
-                srow.src_line = srcl;
-                srow.src_lines = srcl..srcl_next.max(srcl + 1);
-                debug_special_row(host, window, srcl, &srow, base_font);
-                base.borrow_mut().set(k, f32::from(srow.height));
-                shaped.push((k, srow));
-            }
-            crate::prof::end("wy.bf.shape", _t_shape);
+                }
+            };
+            let srcl = base.borrow().src_line(k) as usize;
+            let srcl_next = {
+                let b = base.borrow();
+                if k + 1 < b.n() {
+                    b.src_line(k + 1) as usize
+                } else {
+                    doc.line_count().max(srcl + 1)
+                }
+            };
+            srow.src_line = srcl;
+            srow.src_lines = srcl..srcl_next.max(srcl + 1);
+            debug_special_row(host, window, srcl, &srow, base_font);
+            base.borrow_mut().set(k, f32::from(srow.height));
+            shaped.push((k, srow));
         }
+        crate::prof::end("wy.bf.shape", _t_shape);
+    }
     crate::prof::end("wy.pass2", _t_p2);
     shaped
 }
@@ -1328,7 +1395,10 @@ fn band_hit_test(
     hi: usize,
     caret_line: usize,
     shape_key: u64,
-) -> (Vec<usize>, std::collections::HashMap<usize, std::rc::Rc<ShapedRow>>) {
+) -> (
+    Vec<usize>,
+    std::collections::HashMap<usize, std::rc::Rc<ShapedRow>>,
+) {
     let gen_changed = rd.borrow().frame.borrow().as_ref().is_some_and(|f| {
         (f.rgen, f.igen, f.mgen, f.zgen)
             != (
@@ -1516,8 +1586,8 @@ fn pass3_assemble_rows(
             continue;
         }
         let shown_source = reveal.contains(srcline);
-        let folded_here = !shown_source
-            && (fold_lines.contains(&srcline) || math_body.contains(&srcline));
+        let folded_here =
+            !shown_source && (fold_lines.contains(&srcline) || math_body.contains(&srcline));
         if !folded_here
             && !shown_source
             && let Some(&ridx) = math_start.get(&srcline)
@@ -1960,7 +2030,11 @@ pub fn prewarm_band(
         if st.idle_skip(frame, scroll_top) {
             return;
         }
-        let (tlo, thi) = if st.dir > 0 { (bhi, bhi + q) } else { (blo - q, blo) };
+        let (tlo, thi) = if st.dir > 0 {
+            (bhi, bhi + q)
+        } else {
+            (blo - q, blo)
+        };
         if tlo < 0. || tlo >= thi {
             return;
         }
@@ -2030,10 +2104,11 @@ pub fn prewarm_band(
                         &base_font,
                     );
                     if !shaped_row_has_notdef(&row) {
-                        rd.borrow_mut()
-                            .shape_rows
-                            .borrow_mut()
-                            .put(block_content_id(doc, k), sk, row);
+                        rd.borrow_mut().shape_rows.borrow_mut().put(
+                            block_content_id(doc, k),
+                            sk,
+                            row,
+                        );
                     }
                 }
                 done += 1;
@@ -2230,7 +2305,7 @@ mod tests {
             10..16, // alert 组 0
             30..60, // alert 组 1（包住标题 40..50）
             70..71, // alert 组 2
-            2..20, // 标题组 0（包住 alert 10..16）
+            2..20,  // 标题组 0（包住 alert 10..16）
             40..50, // 标题组 1
         ];
         let split = 3usize;
@@ -2240,13 +2315,20 @@ mod tests {
                 .iter()
                 .find(|r| line > r.start && line < r.end)
                 .cloned();
-            assert_eq!(bin, lin, "line={line}: 分组二分 {bin:?} != 线性首中 {lin:?}");
+            assert_eq!(
+                bin, lin,
+                "line={line}: 分组二分 {bin:?} != 线性首中 {lin:?}"
+            );
         }
         // 关键边界抽查：caret 在标题体内但 callout 外（旧行为=标题体，不能错收成 alert）。
         let b = [10..16, 2..20usize];
         assert_eq!(super::folded_body_at(&b, 1, 3).cloned(), Some(2..20));
         assert_eq!(super::folded_body_at(&b, 1, 16).cloned(), Some(2..20));
-        assert_eq!(super::folded_body_at(&b, 1, 2).cloned(), None, "标题行本身不折叠");
+        assert_eq!(
+            super::folded_body_at(&b, 1, 2).cloned(),
+            None,
+            "标题行本身不折叠"
+        );
         assert_eq!(super::folded_body_at(&b, 1, 20).cloned(), None);
     }
 
@@ -2272,8 +2354,9 @@ mod tests {
             i
         };
         assert!(n >= 2, "夹具应含标题块+代码块, 实得 {n}");
-        let src_lines: Vec<u32> =
-            (0..n).map(|i| doc.block_meta(i).unwrap().src_line).collect();
+        let src_lines: Vec<u32> = (0..n)
+            .map(|i| doc.block_meta(i).unwrap().src_line)
+            .collect();
         let base = Rc::new(RefCell::new(BlockLayout::new(vec![100.0; n], src_lines)));
         let last = n - 1;
         assert_eq!(
@@ -2311,7 +2394,12 @@ mod tests {
         let code: Vec<usize> = (0..doc.block_count())
             .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
             .collect();
-        assert_eq!(code.len(), 2, "夹具需恰好两块围栏代码块, 实得 {}", code.len());
+        assert_eq!(
+            code.len(),
+            2,
+            "夹具需恰好两块围栏代码块, 实得 {}",
+            code.len()
+        );
         let (b0, b1) = (code[0], code[1]);
         let m0 = doc.block_meta(b0).unwrap();
         let m1 = doc.block_meta(b1).unwrap();
@@ -2323,7 +2411,11 @@ mod tests {
         assert_eq!(m1.kind, RowKind::Code);
         assert_eq!(m0.aux, m1.aux, "两块须同跨度");
         assert!(m0.aux > 1, "夹具须为多行代码块才体现「中段」");
-        assert_eq!(doc.line_str(s0), doc.line_str(s1), "两开门围栏行应相同（同语言）");
+        assert_eq!(
+            doc.line_str(s0),
+            doc.line_str(s1),
+            "两开门围栏行应相同（同语言）"
+        );
         let last0 = s0 + m0.aux as usize - 1;
         let last1 = s1 + m1.aux as usize - 1;
         assert_eq!(doc.line_str(last0), doc.line_str(last1), "指纹末行应相同");
@@ -2371,7 +2463,9 @@ mod tests {
         // 渲染模型 + 块布局（小夹具，不触 GIANT 快速路径）。
         let rd = std::cell::RefCell::new(WyRenderModel::new(test_theme()));
         let n = doc.block_count();
-        let src_lines: Vec<u32> = (0..n).map(|i| doc.block_meta(i).unwrap().src_line).collect();
+        let src_lines: Vec<u32> = (0..n)
+            .map(|i| doc.block_meta(i).unwrap().src_line)
+            .collect();
         let base = std::rc::Rc::new(std::cell::RefCell::new(BlockLayout::new(
             vec![100.0; n],
             src_lines,
@@ -2436,7 +2530,12 @@ mod tests {
         let code: Vec<usize> = (0..doc.block_count())
             .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
             .collect();
-        assert_eq!(code.len(), 2, "夹具需恰好两块围栏代码块, 实得 {}", code.len());
+        assert_eq!(
+            code.len(),
+            2,
+            "夹具需恰好两块围栏代码块, 实得 {}",
+            code.len()
+        );
         let (b0, b1) = (code[0], code[1]);
         let m0 = doc.block_meta(b0).unwrap();
         let m1 = doc.block_meta(b1).unwrap();
@@ -2446,15 +2545,27 @@ mod tests {
         assert_eq!(m1.kind, RowKind::Code);
         assert_eq!(m0.aux, m1.aux, "两块须同跨度");
         assert_eq!(m0.aux as usize, a, "夹具须为多行代码块");
-        assert_eq!(doc.line_str(s0u), doc.line_str(s1u), "同语言开门围栏行应相同");
-        assert_ne!(doc.line_str(s0u + 1), doc.line_str(s1u + 1), "夹具首内容行须不同");
+        assert_eq!(
+            doc.line_str(s0u),
+            doc.line_str(s1u),
+            "同语言开门围栏行应相同"
+        );
+        assert_ne!(
+            doc.line_str(s0u + 1),
+            doc.line_str(s1u + 1),
+            "夹具首内容行须不同"
+        );
         // 字节跨度 > 1024B：确保触发 ropey 跨 chunk 路径（修复前 `as_str()`=None → 内容全丢）。
         let own = m0.aux as usize + 2;
         let ls = doc.line_starts();
         let av = ls.get(s0u).unwrap_or(m0.byte as usize);
         let ev = (s0u + own).min(doc.line_count());
         let bv = ls.get(ev).unwrap_or(doc.len());
-        assert!(bv.saturating_sub(av) > 1024, "夹具单块须 >1024B 多 chunk, 实得 {}", bv.saturating_sub(av));
+        assert!(
+            bv.saturating_sub(av) > 1024,
+            "夹具单块须 >1024B 多 chunk, 实得 {}",
+            bv.saturating_sub(av)
+        );
         // 跨 chunk 内容必须进指纹 → 两块 cid 必不同。
         let cid0 = block_content_id(&doc, b0);
         let cid1 = block_content_id(&doc, b1);
@@ -2479,7 +2590,12 @@ mod tests {
         let code: Vec<usize> = (0..doc.block_count())
             .filter(|&i| doc.block_meta(i).is_some_and(|m| m.kind == RowKind::Code))
             .collect();
-        assert_eq!(code.len(), 2, "夹具需恰好两块同内容围栏代码块, 实得 {}", code.len());
+        assert_eq!(
+            code.len(),
+            2,
+            "夹具需恰好两块同内容围栏代码块, 实得 {}",
+            code.len()
+        );
         let cid0 = block_content_id(&doc, code[0]);
         let cid1 = block_content_id(&doc, code[1]);
         assert_eq!(
@@ -2504,7 +2620,10 @@ mod tests {
         }
         let m0 = doc.block_meta(b0).unwrap();
         let m1 = doc.block_meta(b1).unwrap();
-        assert_eq!(m0.aux, m1.aux, "两巨块须同行数（同 aux）才体现「仅内容不同」");
+        assert_eq!(
+            m0.aux, m1.aux,
+            "两巨块须同行数（同 aux）才体现「仅内容不同」"
+        );
         let cid0 = block_content_id(&doc, b0);
         let cid1 = block_content_id(&doc, b1);
         assert_ne!(
@@ -2548,12 +2667,17 @@ mod tests {
 
     /// 两个**同行数（同 aux）** 巨型代码块夹具：各 80 内容行（~72B/行 → 单块 >4KB）、
     /// 内容互不相同（首行与中段全异），返回 `(doc, base, b0, b1)`。
-    fn two_giant_code_blocks_fixture() -> (markdown::doc::Doc, Rc<RefCell<BlockLayout>>, usize, usize) {
+    fn two_giant_code_blocks_fixture()
+    -> (markdown::doc::Doc, Rc<RefCell<BlockLayout>>, usize, usize) {
         let mut first = String::from("```rust\n");
         let mut second = String::from("```rust\n");
         for i in 0..80 {
-            first.push_str(&format!("// 巨块甲 第 {i:02} 行: let var_a_{i:03} = {i:04} & 0xFF; // 填充使单块超 4KB\n"));
-            second.push_str(&format!("// 巨块乙 第 {i:02} 行: let var_b_{i:03} = {i:04} & 0xFF; // 填充使单块超 4KB\n"));
+            first.push_str(&format!(
+                "// 巨块甲 第 {i:02} 行: let var_a_{i:03} = {i:04} & 0xFF; // 填充使单块超 4KB\n"
+            ));
+            second.push_str(&format!(
+                "// 巨块乙 第 {i:02} 行: let var_b_{i:03} = {i:04} & 0xFF; // 填充使单块超 4KB\n"
+            ));
         }
         first.push_str("```\n\n");
         second.push_str("```\n");
@@ -2571,9 +2695,15 @@ mod tests {
         let av = ls.get(src0).unwrap_or(m0.byte as usize);
         let ev = (src0 + own).min(doc.line_count());
         let bv = ls.get(ev).unwrap_or(doc.len());
-        assert!(bv.saturating_sub(av) > 4096, "夹具单巨块须 >4096B, 实得 {}", bv.saturating_sub(av));
+        assert!(
+            bv.saturating_sub(av) > 4096,
+            "夹具单巨块须 >4096B, 实得 {}",
+            bv.saturating_sub(av)
+        );
         let n = doc.block_count();
-        let src_lines: Vec<u32> = (0..n).map(|i| doc.block_meta(i).unwrap().src_line).collect();
+        let src_lines: Vec<u32> = (0..n)
+            .map(|i| doc.block_meta(i).unwrap().src_line)
+            .collect();
         let base = Rc::new(RefCell::new(BlockLayout::new(vec![100.0; n], src_lines)));
         (doc, base, b0, b1)
     }
@@ -2602,7 +2732,11 @@ mod tests {
             code_line: gpui::px(20.8),
             is_dark: false,
         };
-        WyTheme::from_style(&sp, gpui::font(gpui::SharedString::from("monospace")), gpui::px(16.))
+        WyTheme::from_style(
+            &sp,
+            gpui::font(gpui::SharedString::from("monospace")),
+            gpui::px(16.),
+        )
     }
 
     /// M 复现（红测）：`giant_pin` 无上限无逐出。

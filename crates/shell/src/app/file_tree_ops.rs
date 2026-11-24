@@ -203,7 +203,9 @@ impl EditorApp {
 
     /// 执行删除：**任一受影响打开选项卡有未保存修改 → 不删磁盘**（不可静默丢内容，
     /// 提示后取消整个删除，请用户先保存/关闭相关选项卡）；否则干净关闭受影响选项卡
-    /// → 删磁盘 → 树刷新。删根 → 清空文件夹根（等价关文件夹）。
+    /// → **删磁盘移入 background executor**（大目录 `remove_dir_all` 秒级耗时不上
+    /// 事件线程，仅把 FS 调用本身丢后台）→ 完成回调 `window.spawn` 回主线程
+    /// 刷树/会话落盘/状态提示。删根 → 清空文件夹根（等价关文件夹）。
     pub(crate) fn file_tree_delete(
         &mut self,
         path: &std::path::Path,
@@ -211,6 +213,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         let is_dir = path.is_dir();
+        let target = path.to_path_buf();
         // 受影响的打开选项卡：文件精确匹配 / 目录按前缀覆盖子树。
         let affected: Vec<usize> = self
             .model.borrow().tabs
@@ -219,9 +222,9 @@ impl EditorApp {
             .filter(|(_, t)| {
                 t.payload.file_path.as_ref().is_some_and(|p| {
                     if is_dir {
-                        p.starts_with(path)
+                        p.starts_with(&target)
                     } else {
-                        p == path
+                        p == &target
                     }
                 })
             })
@@ -236,30 +239,61 @@ impl EditorApp {
             cx.notify();
             return;
         }
-        // 干净受影响选项卡：同步关闭（下标降序防位移）。
+        // 干净受影响选项卡：同步关闭（下标降序防位移）——UI 副作用保持主线程。
         for &i in affected.iter().rev() {
             self.remove_tab(i, window, cx);
         }
-        // 删磁盘。
-        let res = if is_dir {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_file(path)
-        };
+        let was_root = self.sidebar.files.root.as_deref() == Some(&target);
+        // 删磁盘放后台（`spawn_file_tree_scan` 同款姿势：background spawn → 完成回调
+        // `update_window_entity` 回主线程落地 UI 副作用）。
+        let entity = cx.entity();
+        // 删磁盘放后台（`spawn_file_tree_scan` 同款姿势：background spawn → 完成回调
+        // `update_window_entity` 回主线程落地 UI 副作用）。后台闭包须 `'static`，
+        // 故克隆一份路径自持（不能借用外层 async 帧的捕获）。
+        let target_bg = target.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if is_dir {
+                            std::fs::remove_dir_all(&target_bg)
+                        } else {
+                            std::fs::remove_file(&target_bg)
+                        }
+                    })
+                    .await;
+                let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                    this.apply_file_tree_delete_result(res, &target, is_dir, was_root, window, cx);
+                });
+            })
+            .detach();
+    }
+
+    /// 删除完成回调（主线程）：按删除结果刷树 / 换根 / 会话落盘 + 状态提示——只在
+    /// 后台删除结束后经 `window.spawn` 回到本处执行，UI 副作用永不进后台。
+    fn apply_file_tree_delete_result(
+        &mut self,
+        res: std::io::Result<()>,
+        target: &std::path::Path,
+        is_dir: bool,
+        was_root: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match res {
             Ok(()) => {
-                let was_root = self.sidebar.files.root.as_deref() == Some(path);
                 if was_root {
                     self.sidebar.files.set_root(None);
                     self.persist_prefs(); // opened_folder 写回 null
                 } else {
-                    self.file_tree_invalidate(path, window, cx);
+                    self.file_tree_invalidate(target, window, cx);
                 }
                 self.schedule_session_flush(cx, true);
                 self.model.borrow_mut().status = SharedString::from(format!(
                     "已删除{}{}",
                     if is_dir { "文件夹" } else { "文件" },
-                    path.display()
+                    target.display()
                 ));
                 self.model.borrow_mut().status_ok = true;
             }

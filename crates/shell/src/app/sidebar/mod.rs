@@ -101,7 +101,8 @@ impl EditorApp {
     #[doc(hidden)]
     pub fn toggle_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
         let sb = &mut self.sidebar;
-        self.sidebar_view.update(cx, |v, _| v.toggle_sidebar_view(sb, view));
+        self.sidebar_view
+            .update(cx, |v, _| v.toggle_sidebar_view(sb, view));
         cx.notify();
     }
 
@@ -175,17 +176,30 @@ impl EditorApp {
             return;
         }
         let entity = cx.entity();
-        window.spawn(cx, async move |cx| {
-            let p_read = path.clone();
-            let entries = cx
-                .background_executor()
-                .spawn(async move { shell_sidebar::state::read_dir_entries(&p_read) })
-                .await;
-            let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
-                this.sidebar_file_tree_scan_complete(path, entries, cx);
-            });
-        })
-        .detach();
+        // 防环：快照当前已展开行的 canonical（realpath）集合交单层扫描做「已访问目录」去重
+        // ——symlink/连接点指向其祖先时截断（环不重放）；UI 线程只克隆集合，canonicalize 放
+        // 后台执行（读盘不占主线程）。
+        let expanded_snapshot: std::collections::HashSet<std::path::PathBuf> =
+            self.sidebar.files.expanded.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let p_read = path.clone();
+                let entries = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let expanded_real: std::collections::HashSet<std::path::PathBuf> =
+                            expanded_snapshot
+                                .iter()
+                                .filter_map(|p| std::fs::canonicalize(p).ok())
+                                .collect();
+                        shell_sidebar::state::read_dir_entries(&p_read, &expanded_real)
+                    })
+                    .await;
+                let _ = cx.update_window_entity(&entity, move |this, _w, cx| {
+                    this.sidebar_file_tree_scan_complete(path, entries, cx);
+                });
+            })
+            .detach();
     }
 
     /// 文件树「过滤文件名」防抖调度（`init.rs` 输入框订阅转发到本方法）→ 实体侧
@@ -327,7 +341,10 @@ impl EditorApp {
             // trait 反调——再入本宿主会 RefCell 双借 panic）。宽度持久化在宿主（读模型 prefs）。
             .on_mouse_move(cx.listener(
                 |this: &mut EditorApp, ev: &gpui::MouseMoveEvent, _w, cx| {
-                    if shell_sidebar::state::resize_update(&mut this.sidebar, ev.position.x.as_f32()) {
+                    if shell_sidebar::state::resize_update(
+                        &mut this.sidebar,
+                        ev.position.x.as_f32(),
+                    ) {
                         cx.notify();
                     }
                 },

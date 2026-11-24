@@ -2969,6 +2969,11 @@
                 .collect::<Vec<_>>()
         });
         assert!(!labels.contains(&"d.txt".to_string()), "树应刷新去掉 d.txt");
+        let status = cx.update(|_w, cx| app.read(cx).model.borrow().status.to_string());
+        assert!(
+            status.contains("已删除"),
+            "后台删除完成回调应刷新树并提示已删除，实际={status}"
+        );
 
         // —— 未保存修改的受影响选项卡 → 不删磁盘（不可静默丢内容）——
         cx.update(|_w, cx| {

@@ -1,6 +1,7 @@
 /// B3 增量派生：结构编辑（Enter）后 math 区域**行号平移**而非整篇重扫——编辑线之上
 /// 不变、之下平移 Δ；无区域跨线 → `regions_ver` 不递增（不重建 derived）；区域跨线
-/// （编辑落在 $$ 块内）→ 回退整篇重建（regions_ver++）。
+/// （编辑落在 $$ 块内）→ 2026-11-24 起走**局部重扫回填**（原地重拼 source + 区间平移，
+/// `regions_ver` 不递增），旧实现此处整篇重建（regions_ver++）。
 #[gpui::test]
 fn structural_enter_shifts_derived_math_regions(cx: &mut TestAppContext) {
     use crate::markdown::wysiwyg::WyEditor;
@@ -39,14 +40,20 @@ fn structural_enter_shifts_derived_math_regions(cx: &mut TestAppContext) {
             v0,
             "无区域跨线 → 只用行号平移，不重建派生（B3 增量）"
         );
-        // 结构编辑落在 $$ 块内（跨线）→ 回退整篇重建（区域内容变了无法纯平移）。
+        // 结构编辑落在 $$ 块内（跨线）→ 局部重扫回填：区间随行号平移、source 重拼，
+        // `regions_ver` 不递增（不再整篇重建）。
         let at2 = ed.read(cx).text().as_ref().find("\\int_a").unwrap() + 3;
         let v1 = ed.read(cx).regions_ver();
         ed.update(cx, |e, ecx| e.replace_range(at2..at2, "\n", ecx));
         assert_eq!(
+            ranges(&ed, cx),
+            vec![2usize..6],
+            "块内 Enter 拆行后 $$ 块扩到 2..6 行"
+        );
+        assert_eq!(
             ed.read(cx).regions_ver(),
-            v1.wrapping_add(1),
-            "结构编辑落在 $$ 块内 → 区域内容变化 → 整篇重建派生"
+            v1,
+            "结构编辑落在 $$ 块内 → 局部重扫回填，regions_ver 不递增"
         );
     });
 }

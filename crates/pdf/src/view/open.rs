@@ -40,13 +40,15 @@ pub(super) fn extract_target_precheck(cur_path: &Path, out: &Path) -> Option<Str
         ));
     }
     if let Some(parent) = out.parent()
-        && !parent.as_os_str().is_empty() && !parent.is_dir() {
-            return Some(format!(
-                "无法提取到 {}：目标目录不存在（{}）",
-                out.display(),
-                parent.display()
-            ));
-        }
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return Some(format!(
+            "无法提取到 {}：目标目录不存在（{}）",
+            out.display(),
+            parent.display()
+        ));
+    }
     if out.is_dir() {
         return Some(format!("无法提取到 {}：目标路径是现有目录", out.display()));
     }
@@ -254,6 +256,8 @@ impl PdfViewer {
             grid_drag: None,
             grid_layout_cell: std::cell::RefCell::new(None),
             paged_layout_cell: std::cell::RefCell::new(None),
+            paged_fingerprint: None,
+            paged_layout_rebuilds: 0,
             grid_hold_on_reload: false,
         };
         this.start_load(cx);
@@ -414,20 +418,20 @@ impl PdfViewer {
         self.reset_x_zoom();
         if self.paged_mode_active()
             && let Some(layout) = self.paged_layout_cell.borrow().clone()
-                && layout.rows > 0 {
-                    // 目录/导航跳页 = 确定性锚事件：把 sticky 列钉到所跳之页所在的列
-                    // （`page % cols`），供 `reading_progress` 分页分支按同列解析「真正
-                    // 当前页」——右/奇页跳页不丢列（K177：`col = page % cols`，row_page_start
-                    // = r×cols 同源）。
-                    if layout.cols > 0 {
-                        self.facing_anchor_col = page_index % layout.cols;
-                    }
-                    let r = (page_index / layout.cols).min(layout.rows - 1);
-                    let mag = (layout.row_top[r] * self.zoom.max(0.01))
-                        .clamp(0.0, self.paged_max_scroll());
-                    self.scroll.set_offset(gpui::point(px(0.), px(-mag)));
-                    return;
-                }
+            && layout.rows > 0
+        {
+            // 目录/导航跳页 = 确定性锚事件：把 sticky 列钉到所跳之页所在的列
+            // （`page % cols`），供 `reading_progress` 分页分支按同列解析「真正
+            // 当前页」——右/奇页跳页不丢列（K177：`col = page % cols`，row_page_start
+            // = r×cols 同源）。
+            if layout.cols > 0 {
+                self.facing_anchor_col = page_index % layout.cols;
+            }
+            let r = (page_index / layout.cols).min(layout.rows - 1);
+            let mag = (layout.row_top[r] * self.zoom.max(0.01)).clamp(0.0, self.paged_max_scroll());
+            self.scroll.set_offset(gpui::point(px(0.), px(-mag)));
+            return;
+        }
         let top = self.page_tops.get(page_index).copied().unwrap_or(0.0);
         self.scroll.set_offset(gpui::point(px(0.), px(-top)));
     }
@@ -482,7 +486,12 @@ impl PdfViewer {
                 let page = layout.row_page_start[r0] + col;
                 // 页内比例：分母 = 该页自身高 `cell_h[page]`（非行高）——与 ensure_window
                 // 分页 restore 同分母，行内两页不等高时把「页内»行内」换算收进该页自身。
-                let cell_h = layout.cell_h.get(page).copied().unwrap_or(1.0).max(f32::EPSILON);
+                let cell_h = layout
+                    .cell_h
+                    .get(page)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(f32::EPSILON);
                 let frac = ((content_top / zoom - row_top) / cell_h).clamp(0.0, 1.0);
                 return Some((page, frac, self.zoom));
             }
@@ -801,10 +810,11 @@ impl PdfViewer {
     pub(super) fn nonoverflow_max_xoff(&self, new_w: f32) -> f32 {
         let viewport_w = f32::from(self.scroll.bounds().size.width);
         if self.paged_mode_active()
-            && let Some(l) = self.paged_layout_cell.borrow().as_ref() {
-                let spread = l.spread_max * self.zoom.max(0.01);
-                return ((viewport_w - spread) / 2.0).max(0.0);
-            }
+            && let Some(l) = self.paged_layout_cell.borrow().as_ref()
+        {
+            let spread = l.spread_max * self.zoom.max(0.01);
+            return ((viewport_w - spread) / 2.0).max(0.0);
+        }
         ((viewport_w - new_w) / 2.0).max(0.0)
     }
 
@@ -953,7 +963,7 @@ impl PdfViewer {
     ///   保留窗** GRID_ROW_BUFFER + GRID_KEEP_ROWS = ±4 行——「可视带永不失图」不变式，
     ///   worker 近带保位图、view keep_range 保纹理，回看零重栅）；
     /// - `window` = 中心行 ±(近+中)行的页区间（中带 = window \ near 仅低清）。
-///
+    ///
     /// 无可见行（视口在内容外 / 空文档 / 未布局）→ `None`（本帧不推，下帧可重算）。
     /// `window` 为 `None` 时用 `grid_scroll` 自身 bounds 口径（进入网格/缩放无 Window 路径）。
     pub(crate) fn grid_prewarm_geom(&self, window: Option<&Window>) -> Option<GridPrewarmGeom> {
@@ -993,11 +1003,15 @@ impl PdfViewer {
         let last_page = self.dims.len().saturating_sub(1);
         let near = (
             layout.row_page_start[near_lo_row],
-            layout.row_page_start[near_hi_row + 1].saturating_sub(1).min(last_page),
+            layout.row_page_start[near_hi_row + 1]
+                .saturating_sub(1)
+                .min(last_page),
         );
         let window_interval = (
             layout.row_page_start[lo_row],
-            layout.row_page_start[hi_row + 1].saturating_sub(1).min(last_page),
+            layout.row_page_start[hi_row + 1]
+                .saturating_sub(1)
+                .min(last_page),
         );
         let center_page = layout.row_page_start[center_row as usize];
         Some(GridPrewarmGeom {
@@ -1063,7 +1077,7 @@ impl PdfViewer {
     ///   grid_zoom，独立缩放字段，与阅读 `self.zoom` 无关）派生，进入时不另存固定宽度。
     /// - **退出**：全部网格缩略图与在途请求清理（旧卡图转 `pending_drops` 下帧集中
     ///   `drop_image` 下线 GPU 纹理，不留残留引用；与 `release`/`apply_loaded` 同姿势）。
-///
+    ///
     /// 单列 `scroll` 偏移保持原样——切模式互不干扰，读者退出网格后回到离开时的阅读位置。
     pub fn set_grid_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.grid_mode == enabled {
@@ -1130,7 +1144,8 @@ impl PdfViewer {
         // 真实模式翻转（非网格态）→ 页对应重锚：用当前模式既有口径捕获 (页, 页内比例)，
         // 交给 ensure_window 的 restore_pending 逆换算在下一帧落地（镜像阅读进度恢复时序）。
         // 文档未加载（reading_progress=None）→ 不设 pending（保持滚动位，等效旧行为）。
-        if self.page_mode != mode && !self.grid_mode
+        if self.page_mode != mode
+            && !self.grid_mode
             && let Some((page, frac, _zoom)) = self.reading_progress()
         {
             self.restore_pending = Some((page, frac));
@@ -1686,7 +1701,11 @@ impl PdfViewer {
     /// `k_rows = PAGED_WINDOW_ROWS`；非分页 / 无快照 / 空 → `None`（`ensure_window` 回落
     /// 连续 `keep_window` ±MARGIN 窗口）。布局快照以 `Ref` guard 借出 `&PagedLayout` 直读
     /// （不整表 clone，`ensure_window` 每帧执行路径零分配）。
-    pub(super) fn paged_schedule_window(&self, scroll_y: f32, viewport_h: f32) -> Option<(usize, usize)> {
+    pub(super) fn paged_schedule_window(
+        &self,
+        scroll_y: f32,
+        viewport_h: f32,
+    ) -> Option<(usize, usize)> {
         if !self.paged_mode_active() {
             return None;
         }

@@ -125,8 +125,12 @@ pub fn file_tree_invalidate(files: &mut FileTreeState, changed: &Path) {
     files
         .children
         .retain(|p, _| p != changed && !p.starts_with(changed));
-    files.pending.retain(|p| p != changed && !p.starts_with(changed));
-    files.expanded.retain(|p| p != changed && !p.starts_with(changed));
+    files
+        .pending
+        .retain(|p| p != changed && !p.starts_with(changed));
+    files
+        .expanded
+        .retain(|p| p != changed && !p.starts_with(changed));
     files.layout_gen = files.layout_gen.wrapping_add(1);
 }
 
@@ -225,8 +229,14 @@ pub struct SidebarChromeState {
     /// 内容代号 = `WyEditor::content_gen`：预览关/重装（换实体）与整篇换源（同实体 in-place
     /// 喂料）都使其失效重建，避免渲染上一版条目。
     /// `pub`：宿主/测试直写可见（toc 渲染失效重建）。
-    pub toc_cache:
-        Option<(usize, u64, u64, markdown_wysiwyg::TocEntries, Vec<usize>, MdTocScroll)>,
+    pub toc_cache: Option<(
+        usize,
+        u64,
+        u64,
+        markdown_wysiwyg::TocEntries,
+        Vec<usize>,
+        MdTocScroll,
+    )>,
     /// 侧边栏当前宽度（px）：目录视图随内容自适应，也可右缘拖拽手动调整。
     /// `pub`：宿主/测试直写可见（settings_xfer 直读/直写）。
     pub width: f32,
@@ -344,23 +354,59 @@ pub fn normalize_search_query(q: &str) -> String {
 
 /// 读取目录**直接子项**：文件夹优先、组内按显示名（`to_string_lossy`）字符串排序
 /// （ASCII/CJK 一视同仁）；过滤读取错误项，绝不 panic（失败返回空，展示为「（空）」）。
+///
+/// **目录判定跟随符号链接/连接点**：`DirEntry::file_type().is_dir()` **不跟随**链接——
+/// Windows 的 dir-symlink/junction 与 Unix 指向目录的 symlink 都被它判为文件。此处对非
+/// 真实目录的条目用 `metadata`（跟随链接）重判，使「指向目录的链接」正确展开
+/// （`is_dir=true`）。
+///
+/// **防环（`expanded_real`）**：链接解析到的真实目录若等于「当前扫描目录自身」（直接
+/// 自环）或已出现在 `expanded_real`（已展开行的 canonical 集合）里——symlink 指向其祖先
+/// 时正是此态——再展开只会重放同一棵子树（无限自复制）→ 降级为文件行（不可展开），
+/// 环被截断。快照由宿主 `spawn_file_tree_scan` 从 `expanded` 现算 canonical 后传入。
 /// `pub`：本 crate 的 `files.rs` 后台扫描跨模块调用。
-pub fn read_dir_entries(path: &std::path::Path) -> Vec<TreeEntry> {
+pub fn read_dir_entries(
+    path: &std::path::Path,
+    expanded_real: &std::collections::HashSet<PathBuf>,
+) -> Vec<TreeEntry> {
     let mut dirs: Vec<TreeEntry> = Vec::new();
     let mut files: Vec<TreeEntry> = Vec::new();
     let Ok(rd) = std::fs::read_dir(path) else {
         return Vec::new();
     };
+    // 被扫描目录自身的 canonical 路径：子项里解析回它的链接 = 直接自环。
+    let scan_real = std::fs::canonicalize(path).ok();
     for entry in rd.flatten() {
         let Ok(ft) = entry.file_type() else {
             continue;
         };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if ft.is_dir() {
+            dirs.push(TreeEntry {
+                name,
+                is_dir: true,
+                path: entry.path(),
+            });
+            continue;
+        }
+        // 非真实目录条目：跟随判型（链接指向目录 = 目录）。
+        let is_dir = std::fs::metadata(entry.path())
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        // 防环：解析回「扫描目录自身」或已展开的祖先 realpath → 截断为文件行。
+        let is_loop = is_dir
+            && std::fs::canonicalize(entry.path())
+                .map(|child_real| {
+                    expanded_real.contains(&child_real)
+                        || scan_real.as_deref() == Some(child_real.as_path())
+                })
+                .unwrap_or(false);
         let e = TreeEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
-            is_dir: ft.is_dir(),
+            name,
+            is_dir: is_dir && !is_loop,
             path: entry.path(),
         };
-        if ft.is_dir() {
+        if e.is_dir {
             dirs.push(e);
         } else {
             files.push(e);
@@ -369,4 +415,130 @@ pub fn read_dir_entries(path: &std::path::Path) -> Vec<TreeEntry> {
     dirs.sort_by(|a, b| a.name.cmp(&b.name));
     files.sort_by(|a, b| a.name.cmp(&b.name));
     dirs.into_iter().chain(files).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// 测试临时目录：进程 + 名字 + 自增序号唯一（std 自造，不加依赖）。
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "shell_sidebar_{}_{}_{}",
+            std::process::id(),
+            name,
+            n
+        ))
+    }
+
+    /// Windows：建**目录**符号链接，优先 junction（`mklink /J`，无需开发者模式/管理员）；
+    /// 失败返回 false（无权限 → 上层 SKIP）。
+    #[cfg(windows)]
+    fn create_dir_link(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Unix：目录符号链接；失败返回 false。
+    #[cfg(not(windows))]
+    fn create_dir_link(link: &Path, target: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    /// 回归：文件树把「指向目录的符号链接/连接点」误判为普通文件行——
+    /// `DirEntry::file_type().is_dir()` **不跟随**链接（Windows junction/Unix dir-symlink 均 false），
+    /// 导致这类目录既不能展开、右键也只有文件动作。修复前红：链接被分类为文件。
+    #[test]
+    fn read_dir_entries_classifies_dir_link_as_directory() {
+        let base = unique_temp_dir("file_tree_dir_link");
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        let link = base.join("link");
+        if !create_dir_link(&link, &base.join("sub")) {
+            eprintln!("SKIP: symlink/junction 创建被拒，跳过红测");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let entries = read_dir_entries(&base, &std::collections::HashSet::new());
+        let link_entry = entries
+            .iter()
+            .find(|e| e.name == "link")
+            .expect("链接条目应在扫描结果中");
+        assert!(
+            link_entry.is_dir,
+            "指向子目录的符号链接/连接点应分类为目录（可展开），实得 is_dir={}",
+            link_entry.is_dir
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 防环：链接解析回**当前扫描目录自身**（junction 指向自己的父目录/自身）→ 不得自复制
+    /// 成环 —— 该条目必须降级为文件（is_dir=false，不可展开）。
+    #[test]
+    fn read_dir_entries_truncates_link_back_to_scanned_dir() {
+        let base = unique_temp_dir("file_tree_self_loop");
+        std::fs::create_dir_all(&base).unwrap();
+        let link = base.join("loop");
+        if !create_dir_link(&link, &base) {
+            eprintln!("SKIP: symlink/junction 创建被拒，跳过防环测试");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let empty = std::collections::HashSet::new();
+        let entries = read_dir_entries(&base, &empty);
+        let link_entry = entries
+            .iter()
+            .find(|e| e.name == "loop")
+            .expect("自环链接条目应在扫描结果中");
+        assert!(
+            !link_entry.is_dir,
+            "解析回扫描目录自身（父 junction）的链接应被截断为文件，实得 is_dir={}",
+            link_entry.is_dir
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 防环：链接解析到「已展开行」（expanded_real = canonical 集合）里的目录——symlink
+    /// 指向其祖先时正是此态——不得重放子树 → 降级为文件（不可展开）。模拟宿主
+    /// `spawn_file_tree_scan` 快照 `expanded` 的 canonical 集合后传入。
+    #[test]
+    fn read_dir_entries_truncates_link_to_already_visited_dir() {
+        let base = unique_temp_dir("file_tree_ancestor_loop");
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // sub 内建指向 base 的链接（base 已被展开 → 其 canonical 在 visited 集）。
+        let link = sub.join("up");
+        if !create_dir_link(&link, &base) {
+            eprintln!("SKIP: symlink/junction 创建被拒，跳过防环测试");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let mut visited = std::collections::HashSet::new();
+        if let Ok(r) = std::fs::canonicalize(&base) {
+            visited.insert(r);
+        }
+        let entries = read_dir_entries(&sub, &visited);
+        let link_entry = entries
+            .iter()
+            .find(|e| e.name == "up")
+            .expect("指向已访问目录的链接应在扫描结果中");
+        assert!(
+            !link_entry.is_dir,
+            "解析到已展开/已访问目录的链接应被截断为文件，实得 is_dir={}",
+            link_entry.is_dir
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

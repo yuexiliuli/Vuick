@@ -1,8 +1,8 @@
 use super::*;
 
+use crate::markdown::parse::BlockMeta;
 use crate::markdown::parse::inline_style;
 use crate::markdown::parse::recognition;
-use crate::markdown::parse::BlockMeta;
 
 /// Tab 键的可见缩进单位（H2 修复：不插 `\t`——真机 DirectWrite 把它排成零宽）。
 /// 与编辑区 `tab_size=4` 同格（4 个空格），真机 DirectWrite 对空格排正常可见宽；
@@ -117,38 +117,28 @@ impl WyEditor {
     /// 警报 / 折叠标题），一旦被前文前缀破坏，区域即被吞并/改界，纯行号平移会留下
     /// 陈旧区域 → 才回退整建。纯文本合并（无任何区域）与远离区域边界的合并直接平移，
     /// 省掉整篇 `derived()` 重建 + `text_shared()` 物化 + `fold_plan` 整建（~16ms@6MB）。
-    /// `removed_nl` 为 0（纯插入）时区间为空 → 与旧行为一致。
+    /// `removed_nl` 为 0（纯插入）时区间为空 → 与旧行为一致。返回 `(ok, changed)`：
+    /// `ok=false` 回退整建；`ok=true` 表示成功（纯平移或局部重扫回填），`changed=true`
+    /// 表示局部重扫改动了区域内容/几何（`fold_plan` deltas 须整建，见调用方）。
     fn shift_derived_after_edit(
         &mut self,
         edit_line: usize,
         line_delta: i64,
         removed_nl: usize,
-    ) -> bool {
+    ) -> (bool, bool) {
         let rd = self.rd.borrow_mut();
         let cached = rd.derived.borrow_mut();
         let Some((_, rc)) = cached.as_ref() else {
-            return false;
+            return (false, false);
         };
         let mut d = rc.borrow_mut();
         // 被删除换行吸收的行区间（起始边界直接落在其中 → 区域有被吞并风险）。
         let abs_starts = edit_line + 1..=edit_line + removed_nl;
-        // 跨线/跨吸收区间区域：编辑线落在区域内 → 内容/边界变了，无法纯平移。
-        if super::view::region_containing(&d.math_regions, |r| r.range.clone(), edit_line, true)
-            .is_some()
-            || d.alert_fold_regions
-                .iter()
-                .any(|(r, _)| r.start <= edit_line && edit_line < r.end)
-            || super::view::region_containing(
-                &d.heading_fold_bodies,
-                |r| r.clone(),
-                edit_line,
-                true,
-            )
-            .is_some()
-            // Cut-1a：某区域**起始行**落在被吸收行区间 → 起始标记可能被合并吞掉。
-            || d.math_regions
-                .iter()
-                .any(|r| abs_starts.contains(&r.range.start))
+        // Cut-1a：某区域**起始行**落在被吸收行区间 → 起始标记可能被合并吞掉 → 结构被
+        // 破坏、无法局部重扫证明 → 回退整建（保持既有判定）。
+        if d.math_regions
+            .iter()
+            .any(|r| abs_starts.contains(&r.range.start))
             || d.alert_fold_regions
                 .iter()
                 .any(|(r, _)| abs_starts.contains(&r.start))
@@ -156,7 +146,16 @@ impl WyEditor {
                 .iter()
                 .any(|r| abs_starts.contains(&r.start))
         {
-            return false;
+            return (false, false);
+        }
+        // M5-B3-1 增补：编辑线落在既有区域**内部**时，旧实现一律整篇重建（`regions_ver++`
+        // → `derived()` 全篇 `text_shared()` 物化 + 三表 O(N) 重扫，~17ms@6MB/键）。改为
+        // 尝试「局部重扫回填」——能证明区域边界不受编辑影响就就地更新被编辑区域、尾部照
+        // 旧平移；任一张表无法证明 → 返回 false → 调用方回退整建（旧语义原样保留）。
+        let (ok, changed) =
+            self.try_local_rescan_inside_regions(edit_line, line_delta, removed_nl, &mut d);
+        if !ok {
+            return (false, false);
         }
         let shift = |x: usize| -> usize { (x as i64 + line_delta).max(0) as usize };
         // 三处「行号 > edit_line 平移」（数学区域 / 警报折叠区 / 标题折叠体）同规则——
@@ -196,7 +195,121 @@ impl WyEditor {
                 *hb = shift(hb.start)..shift(hb.end);
             }
         }
-        true
+        (true, changed)
+    }
+
+    /// M5-B3-1 增补（**块内结构编辑局部重扫回填**，替代整篇重建）：`edit_line` 落在
+    /// 既有区域（math `$$…$$` / 可折叠 callout / 标题折叠体）**内部**、且编辑窗口未
+    /// 新建/破坏任何区域**边界**时——该区域几何可证不变（仅内部内容/行数变化）→ 就地
+    /// 回填该区域（math 重拼 `source`；三表区间随 `line_delta` 平移），不递增
+    /// `regions_ver`（`derived` Rc 就地修补，`fp_sets` 由 `regions_shift_ver++` 重建）。
+    ///
+    /// 每张表**独立**判定（可嵌套：`$$` 块可落在折叠标题体/`>` 引述之下；`alert_regions`
+    /// 不受代码围栏约束，`$$` 块与 callout 不能同线但可嵌套于不同表）。逐表不变量：
+    /// - **math**：编辑线严格在开、闭围栏之间（非围栏行，`region_containing(incl_start)`
+    ///   会把 `==start` 的围栏行也算内部 → 显式 `edit_line <= start` 排除）；闭围栏不在
+    ///   被删除行窗（`end-1 <= edit_line+removed_nl` 即被吞）→ 闭围栏下移 `line_delta`、
+    ///   `source` 由新 doc 行 `[start+1, end_new-1)` 重拼（`$$` 块内部无其它 `$$` 围栏，
+    ///   故只需防「窗口新起 `$$`」→ `trim()=="$$"` 即回退）。
+    /// - **alert**：编辑线严格在 marker 行之后（`> [!]`）；末行 `>` 体未被吸收；窗口每行
+    ///   仍是普通 `>` 引述体（`blockquote_prefix` 有 + 非新 marker）——否则区域缩水/分裂。
+    ///   折叠态来自 marker 行（未动）→ 保留。
+    /// - **heading-fold**：编辑线严格在标题行之后；section 终止行（下一同/高级标题，
+    ///   `heading_fold_regions` 的 stop）未被吸收；窗口无新标题行（否则 section 提前终止 /
+    ///   新建嵌套折叠）→ 区间平移。
+    ///
+    /// 任一张表不能证明不变量 → 返回 `(false, _)`，调用方回退整篇重建（与旧语义逐位
+    /// 一致：旧实现「落在区域内」一律整建，本函数只把**可证明**的子集放行局部）。被删
+    /// 除行窗内区域**起始行**被吞的情形由 `shift_derived_after_edit` 前置 `abs_starts`
+    /// 判定兜底。返回 `(ok, changed)`：`changed=true` 表示就地改动了某区域内容/几何
+    /// ——`fold_plan` 的 deltas 增量平移前提被破坏，须回退整建（见
+    /// `WyRenderModel::struct_region_content_changed`）。
+    fn try_local_rescan_inside_regions(
+        &self,
+        edit_line: usize,
+        line_delta: i64,
+        removed_nl: usize,
+        d: &mut WyDerived,
+    ) -> (bool, bool) {
+        let mut changed = false;
+        let inserted_nl = (line_delta + removed_nl as i64).max(0) as usize;
+        let max_line = self.doc.line_starts().len().saturating_sub(1);
+        // 编辑影响的**新**行窗（含插入行）：局部重扫只需证明这些行不引入区域边界。
+        let win_hi = (edit_line + inserted_nl).min(max_line);
+        // ① 数学块 `$$…$$` 内部。
+        let math_inside =
+            super::view::region_containing(&d.math_regions, |r| r.range.clone(), edit_line, true);
+        if let Some(midx) = math_inside {
+            let rng = d.math_regions[midx].range.clone();
+            // 开围栏行被编辑（==start）或闭围栏行（end-1）落在被删除行窗/被编辑行 →
+            // 边界可能被拆 → 无法局部。
+            if edit_line <= rng.start || rng.end.saturating_sub(1) <= edit_line + removed_nl {
+                return (false, changed);
+            }
+            // 窗口内新起 `$$` 围栏行 → 块分裂/提前闭合 → 整建。
+            for l in edit_line..=win_hi {
+                if self.doc.line_str(l).trim() == "$$" {
+                    return (false, changed);
+                }
+            }
+            let new_end = (rng.end as i64 + line_delta).max(rng.start as i64 + 2) as usize;
+            let source = if rng.start + 1 < new_end.saturating_sub(1) {
+                (rng.start + 1..new_end.saturating_sub(1))
+                    .map(|l| self.doc.line_str(l))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            changed = true;
+            d.math_regions[midx].range = rng.start..new_end;
+            d.math_regions[midx].source = source;
+        }
+        // ② 警报（可折叠 callout）内部。
+        let alert_inside = d
+            .alert_fold_regions
+            .iter()
+            .position(|(r, _)| r.start <= edit_line && edit_line < r.end);
+        if let Some(aidx) = alert_inside {
+            let (rng, folded) = d.alert_fold_regions[aidx].clone();
+            if edit_line <= rng.start || rng.end.saturating_sub(1) <= edit_line + removed_nl {
+                return (false, changed);
+            }
+            // 窗口每行仍须是普通 `>` 引述体（存 `>` 前缀且非新 marker）：
+            // 前缀丢失 → 区域缩水；新 marker → 分裂。任一不合格即整建。
+            for l in edit_line..=win_hi {
+                let raw = self.doc.line_str(l);
+                let is_body = inline_style::blockquote_prefix(&raw)
+                    .map(|p| recognition::alert_prefix(&raw[p..]).is_none())
+                    .unwrap_or(false);
+                if !is_body {
+                    return (false, changed);
+                }
+            }
+            let new_end = (rng.end as i64 + line_delta).max(rng.start as i64 + 1) as usize;
+            changed = true;
+            d.alert_fold_regions[aidx] = (rng.start..new_end, folded);
+        }
+        // ③ 标题折叠体内部。
+        let head_inside =
+            super::view::region_containing(&d.heading_fold_bodies, |r| r.clone(), edit_line, true);
+        if let Some(hidx) = head_inside {
+            let rng = d.heading_fold_bodies[hidx].clone();
+            if edit_line <= rng.start || rng.end <= edit_line + removed_nl {
+                return (false, changed);
+            }
+            // 窗口内出现新标题行 → section 提前终止 / 新建（折叠）子项 → 整建。
+            for l in edit_line..=win_hi {
+                let raw = self.doc.line_str(l);
+                if inline_style::line_heading_level(&raw).is_some() {
+                    return (false, changed);
+                }
+            }
+            let new_end = (rng.end as i64 + line_delta).max(rng.start as i64 + 1) as usize;
+            changed = true;
+            d.heading_fold_bodies[hidx] = rng.start..new_end;
+        }
+        (true, changed)
     }
 
     /// 从块元数据构造可编辑区域（代码内容行 / 表格表头+数据行）。`rebuild_block_regions`
@@ -284,7 +397,9 @@ impl WyEditor {
         let win_hi = (edit_blk + 2).min(n);
         for i in edit_blk..win_hi {
             let Some(m) = doc.block_meta(i) else { continue };
-            let Some(r) = Self::region_for_block_meta(&m) else { continue };
+            let Some(r) = Self::region_for_block_meta(&m) else {
+                continue;
+            };
             let rl = span(&r).0;
             let pos = kept.partition_point(|k| span(k).1 < rl);
             kept.insert(pos, r);
@@ -469,7 +584,10 @@ impl WyEditor {
         // 输入/删除/粘贴 → 静止期常亮（blink 暂停，先亮住再继续闪）。
         self.caret_phase.kick();
         *self.rd.borrow_mut().frame.borrow_mut() = None;
-        { let rd = self.rd.borrow_mut(); rd.content_gen.set(rd.content_gen.get().wrapping_add(1)); }
+        {
+            let rd = self.rd.borrow_mut();
+            rd.content_gen.set(rd.content_gen.get().wrapping_add(1));
+        }
         crate::prof::end("wy.replace_range", _t_rr);
         cx.emit(WyEvent::Changed);
         cx.notify();
@@ -582,15 +700,26 @@ impl WyEditor {
         // 每轮编辑先清「结构编辑待消费」标志；结构性分支再置位（见字段注释）。
         self.rd.borrow_mut().struct_edit_pending.set(false);
         // 内容寻址整形缓存：被编辑块旧指纹行先剔除（内容已变，本帧起按新指纹重排）。
-        self.rd.borrow_mut().shape_rows.borrow_mut().invalidate_ids(&[old_cid]);
+        self.rd
+            .borrow_mut()
+            .shape_rows
+            .borrow_mut()
+            .invalidate_ids(&[old_cid]);
         // Pass1 增量高度重估起点；三段式（前缀 / 变化中段 / 尾部复用）定位用。
         self.rd.borrow_mut().struct_dirty_line.set(edit_line);
-        self.rd.borrow_mut().struct_old_end_line
+        self.rd
+            .borrow_mut()
+            .struct_old_end_line
             .set(edit_line + removed.matches('\n').count());
-        self.rd.borrow_mut().struct_line_delta
+        self.rd
+            .borrow_mut()
+            .struct_line_delta
             .set(text.matches('\n').count() as i64 - removed.matches('\n').count() as i64);
         if structural {
-            { let rd = self.rd.borrow_mut(); rd.struct_ver.set(rd.struct_ver.get().wrapping_add(1)); }
+            {
+                let rd = self.rd.borrow_mut();
+                rd.struct_ver.set(rd.struct_ver.get().wrapping_add(1));
+            }
             *self.rd.borrow_mut().pending_patch_blocks.borrow_mut() = None;
             // 结构编辑：块行号/身份可能位移 → 数学位图钉随行号作废。
             self.clear_math_pins();
@@ -598,11 +727,16 @@ impl WyEditor {
             // 代码块的横向滚动/缩放残留到新块）→ 按窗清块视图态；窗外块内容未变保留。
             self.clear_src_line_view_state(
                 edit_line,
-                removed.matches('\n').count().max(text.matches('\n').count()),
+                removed
+                    .matches('\n')
+                    .count()
+                    .max(text.matches('\n').count()),
             );
             // fold_plan deltas 增量平移的编辑信息：被编辑块旧下标 + 块数净增。
             self.rd.borrow_mut().struct_blk_old.set(edit_blk);
-            self.rd.borrow_mut().struct_blk_span_delta
+            self.rd
+                .borrow_mut()
+                .struct_blk_span_delta
                 .set(self.doc.block_count() as i64 - prev_count as i64);
             self.rd.borrow_mut().struct_edit_pending.set(true);
             // 整形缓存**内容寻址**（`frame::block_content_id`）：位移但内容未变的块指纹
@@ -610,12 +744,16 @@ impl WyEditor {
             // 指纹已变）自然 miss。（旧实现按块下标键，这里曾不得不 retain_prefix 保前缀
             // 丢后缀，Enter 仍整带重排。）notdef 重试表仍按下标：前缀保留、≥ edit 作废。
             let prefix_keep = edit_blk.min(prev_count);
-            self.rd.borrow_mut().notdef_retry.borrow_mut().retain_prefix(prefix_keep);
+            self.rd
+                .borrow_mut()
+                .notdef_retry
+                .borrow_mut()
+                .retain_prefix(prefix_keep);
             // 结构编辑清空整形缓存 → 预热进度全部作废：归零方向/偏差/带序号，
             // 下一帧由带序号跨界重新判定方向（否则拿旧 dir 在空区间空转）。
             // 静置门控签名一并复位（内容已变，下一 prewarm 帧按「变化帧」放行）。
             let rd = self.rd.borrow_mut();
-        let mut pw = rd.prewarm.borrow_mut();
+            let mut pw = rd.prewarm.borrow_mut();
             pw.dir = 0;
             pw.bias = 0;
             pw.last_band_idx = None;
@@ -626,7 +764,11 @@ impl WyEditor {
             let blk = self.doc.block_index_for_line(edit_line);
             *self.rd.borrow_mut().pending_patch_blocks.borrow_mut() = Some(vec![blk]);
             // 该块内容变了 → 指纹自然变 → 整形缓存自生效（无需显式作废）。
-            self.rd.borrow_mut().notdef_retry.borrow_mut().clear_block(blk);
+            self.rd
+                .borrow_mut()
+                .notdef_retry
+                .borrow_mut()
+                .clear_block(blk);
         }
     }
 
@@ -670,15 +812,16 @@ impl WyEditor {
             let line_delta =
                 (text.matches('\n').count() as i64) - (removed.matches('\n').count() as i64);
             let removed_nl = removed.matches('\n').count();
-            if !self.shift_derived_after_edit(edit_line, line_delta, removed_nl) {
-                { let rd = self.rd.borrow_mut(); rd.regions_ver.set(rd.regions_ver.get().wrapping_add(1)); }
-            } else if self.edit_window_creates_folded_heading(
-                edit_line,
-                text.matches('\n').count(),
-            ) || self.edit_window_creates_region_marker(
-                edit_line,
-                text.matches('\n').count(),
-            ) {
+            let (shift_ok, content_changed) =
+                self.shift_derived_after_edit(edit_line, line_delta, removed_nl);
+            if !shift_ok {
+                {
+                    let rd = self.rd.borrow_mut();
+                    rd.regions_ver.set(rd.regions_ver.get().wrapping_add(1));
+                }
+            } else if self.edit_window_creates_folded_heading(edit_line, text.matches('\n').count())
+                || self.edit_window_creates_region_marker(edit_line, text.matches('\n').count())
+            {
                 // M5-B3-1 子项 4：**插入窗口新建了命中已折叠键的标题行**（重复折叠
                 // 同款标题：行号平移只能搬旧折叠体、无法新建折叠体）→ 回退整篇重建。
                 // Cut-1a 补口：**新建区域起始行**（`$$` 围栏 / 整行 `$$…$$` / `> [!]`
@@ -686,10 +829,19 @@ impl WyEditor {
                 // `edit_window_creates_region_marker`）。
                 // （Cut-1a：跨行删除/合并的边界语义已由 `shift_derived_after_edit` 的
                 // 显式区域边界判定承担——纯文本合并不再无谓整建。）
-                { let rd = self.rd.borrow_mut(); rd.regions_ver.set(rd.regions_ver.get().wrapping_add(1)); }
+                {
+                    let rd = self.rd.borrow_mut();
+                    rd.regions_ver.set(rd.regions_ver.get().wrapping_add(1));
+                }
             } else {
-                // 成功平移：region 结构不变、只是行号动 → 递增 `fp_sets` 缓存键的
-                // 行号平移分量（集合命中旧行号即错）。
+                // 成功平移 / 局部重扫回填：region 结构不变、只是行号动 → 递增 `fp_sets`
+                // 缓存键的行号平移分量（集合命中旧行号即错）。局部重扫改动了区域
+                // 内容/几何（`content_changed`）时，`fold_plan` deltas 的增量平移前提被
+                // 破坏（未闭合 `$$` 的卡块远离编辑行会留陈旧卡高）→ 置 `fold_plan`
+                // 整建标志（读取即清；整建 O(块数)，远便宜于 `derived` 的 O(N) 全文重扫）。
+                if content_changed {
+                    self.rd.borrow_mut().struct_region_content_changed.set(true);
+                }
                 {
                     let rd = self.rd.borrow_mut();
                     rd.regions_shift_ver
@@ -712,7 +864,10 @@ impl WyEditor {
                 if self.maybe_patch_sig_changed_plain(edit_line, old_line, &new_line) {
                     // 本地已修补，`regions_ver` 不递增（derived Rc 跨键复用）。
                 } else {
-                    { let rd = self.rd.borrow_mut(); rd.regions_ver.set(rd.regions_ver.get().wrapping_add(1)); }
+                    {
+                        let rd = self.rd.borrow_mut();
+                        rd.regions_ver.set(rd.regions_ver.get().wrapping_add(1));
+                    }
                 }
             } else {
                 let _t_m = crate::prof::begin();
@@ -847,7 +1002,9 @@ impl WyEditor {
     /// 返回 `true` 让调用方回退整篇重建。先计数短路（无 `$`/`[!` 必无此类区域），
     /// O(插入行数) 次 `line_str`——纯文本合并窗口内无任何区域开界 → 不影响 Cut-1a 快路径。
     fn edit_window_creates_region_marker(&self, edit_line: usize, inserted_nl: usize) -> bool {
-        if self.rd.borrow().math_dollar_cnt.get() == 0 && self.rd.borrow().alert_marker_cnt.get() == 0 {
+        if self.rd.borrow().math_dollar_cnt.get() == 0
+            && self.rd.borrow().alert_marker_cnt.get() == 0
+        {
             return false;
         }
         let max_line = self.doc.line_starts().len().saturating_sub(1);
@@ -907,7 +1064,7 @@ impl WyEditor {
         }
         {
             let rd = self.rd.borrow_mut();
-        let mut folded = rd.folded_headings.borrow_mut();
+            let mut folded = rd.folded_headings.borrow_mut();
             if was_folded {
                 folded.remove(&key);
             } else {
@@ -915,7 +1072,10 @@ impl WyEditor {
             }
         }
         // 折叠态变化 → `fold_plan` 缓存失效（滚动/带移动间不重算，但折叠变必须重建）。
-        { let rd = self.rd.borrow_mut(); rd.fold_ver.set(rd.fold_ver.get().wrapping_add(1)); }
+        {
+            let rd = self.rd.borrow_mut();
+            rd.fold_ver.set(rd.fold_ver.get().wrapping_add(1));
+        }
         // M5-B3-1 子项 4：标题折叠体列表是 `fold_plan` sets 输入之一、按 `fold_ver`
         // 进缓存键——这里**就地**重扫进 `derived`（`regions_ver` 键不变 → 不整篇重建；
         // 折叠翻转本身稀有，允许一次 O(n) 全扫 + `text_shared`；逐键输入/Enter 不再触达）。
@@ -1054,7 +1214,10 @@ impl WyEditor {
         // 撤销/重做等净逆操作落地 → 静止期常亮。
         self.caret_phase.kick();
         *self.rd.borrow_mut().frame.borrow_mut() = None;
-        { let rd = self.rd.borrow_mut(); rd.content_gen.set(rd.content_gen.get().wrapping_add(1)); }
+        {
+            let rd = self.rd.borrow_mut();
+            rd.content_gen.set(rd.content_gen.get().wrapping_add(1));
+        }
         crate::prof::end("wy.replace_range", _t_rr);
         cx.emit(WyEvent::Changed);
         cx.notify();
@@ -1154,14 +1317,13 @@ impl WyEditor {
         let end = self.doc.rope().ceil_char_boundary(at + 1);
         // CRLF：删 `\n`（行尾换行、`at` 落在 CRLF 的 `\n` 上）→ 前导 `\r` 一并纳入删除
         // 区间（`\r\n` 当一个换行单元），不留孤立 `\r` 污染源文本。单行内文本无此形态。
-        let start = if at > 0
-            && self.doc.rope().byte(at) == b'\n'
-            && self.doc.rope().byte(at - 1) == b'\r'
-        {
-            at - 1
-        } else {
-            at
-        };
+        let start =
+            if at > 0 && self.doc.rope().byte(at) == b'\n' && self.doc.rope().byte(at - 1) == b'\r'
+            {
+                at - 1
+            } else {
+                at
+            };
         self.replace_range(start..end, "", cx);
     }
 
@@ -1248,7 +1410,8 @@ impl WyEditor {
             (line_a..=line_b).map(|r| self.line_start(r)).collect();
         // 行首逐个前缀缩进（尾换行后的幻影空行不插；CRLF 的 `\r` 视为行内容保留）。
         let old_span = self.doc.slice_str(span_start..span_end);
-        let mut new_span = String::with_capacity(old_span.len() + TAB_INDENT.len() * line_starts.len());
+        let mut new_span =
+            String::with_capacity(old_span.len() + TAB_INDENT.len() * line_starts.len());
         let mut at_start = true;
         for ch in old_span.chars() {
             if at_start {
